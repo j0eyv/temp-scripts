@@ -219,6 +219,34 @@ function Invoke-GraphPagedGet {
 
   $tokenString = ConvertTo-TokenString -TokenValue $Token
 
+  $getCaseInsensitiveMember = {
+    param($Object, [string]$Name)
+
+    if ($null -eq $Object) { return $null }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+      foreach ($key in $Object.Keys) {
+        if ([string]$key -ieq $Name) {
+          return $Object[$key]
+        }
+      }
+      return $null
+    }
+
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($prop) {
+      return $prop.Value
+    }
+
+    foreach ($p in $Object.PSObject.Properties) {
+      if ([string]$p.Name -ieq $Name) {
+        return $p.Value
+      }
+    }
+
+    return $null
+  }
+
   $url   = "$GraphBaseUrl$Path"
   $items = [System.Collections.Generic.List[object]]::new()
   $pageCount = 0
@@ -261,30 +289,61 @@ function Invoke-GraphPagedGet {
 
     $pageCount++
 
-    $value = $null
-    if ($response -is [System.Collections.IDictionary]) {
-      foreach ($key in $response.Keys) {
-        if ([string]$key -ieq 'value') {
-          $value = $response[$key]
-          break
+    $value = & $getCaseInsensitiveMember $response 'value'
+
+    # Some runtimes may wrap Graph responses and expose another nested `value`
+    # object. Unwrap recursively until we reach a real array payload.
+    $unwrapDepth = 0
+    while ($null -ne $value -and $unwrapDepth -lt 5) {
+      $unwrapDepth++
+
+      if ($value -is [System.Collections.IDictionary]) {
+        $nested = & $getCaseInsensitiveMember $value 'value'
+        if ($null -ne $nested) {
+          $value = $nested
+          continue
         }
       }
-    }
 
-    if ($null -eq $value) {
-      $valueProp = $response.PSObject.Properties['value']
-      if (-not $valueProp) {
-        $valueProp = $response.PSObject.Properties['Value']
+      if (
+        -not ($value -is [string]) -and
+        -not ($value -is [System.Collections.IDictionary]) -and
+        $value -isnot [System.Array] -and
+        $value -is [System.Collections.IEnumerable]
+      ) {
+        # IEnumerable that is not a dictionary/array is likely already a collection.
+        break
       }
-      if ($valueProp) {
-        $value = $valueProp.Value
+
+      if (
+        -not ($value -is [string]) -and
+        -not ($value -is [System.Collections.IEnumerable])
+      ) {
+        $nested = & $getCaseInsensitiveMember $value 'value'
+        if ($null -ne $nested) {
+          $value = $nested
+          continue
+        }
       }
+
+      break
     }
 
     if ($null -ne $value) {
-      if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
+      if ($value -is [System.Collections.IDictionary]) {
+        # Treat dictionary-with-id as a single policy object; otherwise do not
+        # enumerate dictionary entries (which would become Key/Value metadata rows).
+        $hasId = $null -ne (& $getCaseInsensitiveMember $value 'id')
+        if ($hasId) {
+          $items.Add($value)
+        } else {
+          Write-RunbookLog -Level 'WARN' -Message "Graph collection '$Path' returned dictionary payload without id; skipping dictionary entry enumeration to avoid metadata pollution."
+        }
+      }
+      elseif ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
         foreach ($item in $value) { $items.Add($item) }
-      } else {
+      }
+      else {
         # Defensive fallback: Graph collection payload should always be an array.
         # If it is not, still add the single object so the run doesn't silently drop it.
         $items.Add($value)
@@ -326,6 +385,24 @@ function Invoke-GraphPagedGet {
   }
 
   Write-RunbookLog -Level 'DEBUG' -Message "Graph collection '$Path' pages: $pageCount, items: $($items.Count)"
+
+  if ($items.Count -gt 0) {
+    $sample = $items[0]
+    $sampleId = ''
+    if ($sample -is [System.Collections.IDictionary]) {
+      foreach ($k in $sample.Keys) {
+        if ([string]$k -ieq 'id') {
+          $sampleId = [string]$sample[$k]
+          break
+        }
+      }
+    } else {
+      $idProp = $sample.PSObject.Properties['id']
+      if ($idProp) { $sampleId = [string]$idProp.Value }
+    }
+
+    Write-RunbookLog -Level 'DEBUG' -Message "Graph collection '$Path' sample item type: $($sample.GetType().FullName), hasId: $(-not [string]::IsNullOrWhiteSpace($sampleId))"
+  }
 
   return , $items.ToArray()
 }
