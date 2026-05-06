@@ -72,6 +72,102 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$ScriptVersion = '2.11-debug'
+$VerbosePreference = 'Continue'
+
+function Write-RunbookLog {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Message,
+    [ValidateSet('INFO', 'WARN', 'ERROR', 'DEBUG')] [string]$Level = 'INFO'
+  )
+
+  $ts = (Get-Date).ToUniversalTime().ToString('o')
+  Write-Output "[$ts][$Level] $Message"
+}
+
+function Write-ExceptionDetails {
+  param(
+    [Parameter(Mandatory = $true)] [System.Management.Automation.ErrorRecord]$ErrorRecord
+  )
+
+  Write-Output "[EXCEPTION] Type      : $($ErrorRecord.Exception.GetType().FullName)"
+  Write-Output "[EXCEPTION] Message   : $($ErrorRecord.Exception.Message)"
+  if ($ErrorRecord.InvocationInfo) {
+    Write-Output "[EXCEPTION] Command   : $($ErrorRecord.InvocationInfo.MyCommand)"
+    Write-Output "[EXCEPTION] Script    : $($ErrorRecord.InvocationInfo.ScriptName)"
+    Write-Output "[EXCEPTION] Line      : $($ErrorRecord.InvocationInfo.ScriptLineNumber)"
+    Write-Output "[EXCEPTION] Position  : $($ErrorRecord.InvocationInfo.OffsetInLine)"
+    Write-Output "[EXCEPTION] LineText  : $($ErrorRecord.InvocationInfo.Line)"
+  }
+  if ($ErrorRecord.ScriptStackTrace) {
+    Write-Output "[EXCEPTION] Stack     : $($ErrorRecord.ScriptStackTrace)"
+  }
+}
+
+function ConvertTo-TokenString {
+  param(
+    [Parameter(Mandatory = $true)] $TokenValue
+  )
+
+  if ($TokenValue -is [securestring]) {
+    return [System.Net.NetworkCredential]::new('', $TokenValue).Password
+  }
+
+  return [string]$TokenValue
+}
+
+function Is-ExpiredTokenError {
+  param(
+    [Parameter(Mandatory = $true)] $ErrorRecord
+  )
+
+  $text = [string]$ErrorRecord
+  if ($text -match 'ExpiredAuthenticationToken|Authentication token has expired|access token expiry') {
+    return $true
+  }
+
+  if ($ErrorRecord.Exception -and $ErrorRecord.Exception.Message -match 'ExpiredAuthenticationToken|Authentication token has expired|access token expiry') {
+    return $true
+  }
+
+  return $false
+}
+
+function Is-ThrottlingError {
+  param(
+    [Parameter(Mandatory = $true)] $ErrorRecord
+  )
+
+  try {
+    $statusCode = [int]$ErrorRecord.Exception.Response.StatusCode
+    return $statusCode -eq 429
+  } catch {
+    return $false
+  }
+}
+
+function Get-RetryAfterSeconds {
+  param(
+    [Parameter(Mandatory = $true)] $ErrorRecord,
+    [int]$DefaultSeconds = 5
+  )
+
+  try {
+    $retryAfter = $ErrorRecord.Exception.Response.Headers['Retry-After']
+    if ($retryAfter -and [int]::TryParse([string]$retryAfter, [ref]0)) {
+      return [int]$retryAfter
+    }
+  } catch {}
+
+  return $DefaultSeconds
+}
+
+trap {
+  Write-RunbookLog -Level 'ERROR' -Message 'Unhandled terminating error in runbook.'
+  Write-ExceptionDetails -ErrorRecord $_
+  throw
+}
+
 #region ── Helpers ─────────────────────────────────────────────────────────────
 
 function Get-ManagedIdentityToken {
@@ -84,34 +180,97 @@ function Get-ManagedIdentityToken {
     [string]$ResourceUrl
   )
 
-  $tokenObj = Get-AzAccessToken -ResourceUrl $ResourceUrl -AsSecureString:$false
-  if ([string]::IsNullOrWhiteSpace($tokenObj.Token)) {
+  try {
+    # Avoid -AsSecureString for compatibility with older Az.Accounts versions in Automation.
+    [void](Write-RunbookLog -Level 'DEBUG' -Message "Acquiring token for resource: $ResourceUrl")
+    $tokenObj = Get-AzAccessToken -ResourceUrl $ResourceUrl
+  } catch {
+    [void](Write-RunbookLog -Level 'ERROR' -Message "Get-AzAccessToken failed for resource: $ResourceUrl")
+    [void](Write-ExceptionDetails -ErrorRecord $_)
+    throw
+  }
+
+  # Log the token type so we can diagnose future version changes in Az.Accounts.
+  $rawToken = $tokenObj.Token
+  [void](Write-RunbookLog -Level 'DEBUG' -Message "Token type returned by Get-AzAccessToken: $($rawToken.GetType().FullName)")
+
+  # Convert to plain string regardless of whether Az.Accounts returns SecureString or String.
+  $token = ConvertTo-TokenString -TokenValue $rawToken
+
+  if ([string]::IsNullOrWhiteSpace($token)) {
     throw "Failed to acquire access token for resource '$ResourceUrl'."
   }
-  return $tokenObj.Token
+
+  [void](Write-RunbookLog -Level 'DEBUG' -Message "Token acquired for resource: $ResourceUrl")
+  return $token
 }
 
 function Invoke-GraphPagedGet {
   <#
   .SYNOPSIS Pages through a Graph collection endpoint and returns all items as
             a flat array, following @odata.nextLink automatically.
+            Implements exponential backoff retry for 429 throttling errors.
   #>
   param(
     [Parameter(Mandatory = $true)] [string]$Path,
-    [Parameter(Mandatory = $true)] [string]$Token
+    [Parameter(Mandatory = $true)] $Token,
+    [int]$MaxRetries = 5
   )
+
+  $tokenString = ConvertTo-TokenString -TokenValue $Token
 
   $url   = "$GraphBaseUrl$Path"
   $items = [System.Collections.Generic.List[object]]::new()
 
   while ($url) {
-    $response = Invoke-RestMethod -Method GET -Uri $url `
-      -Headers @{ Authorization = "Bearer $Token"; ConsistencyLevel = 'eventual' }
+    $retryCount = 0
+    $requestCompleted = $false
 
-    if ($response.value) {
-      foreach ($item in $response.value) { $items.Add($item) }
+    while (-not $requestCompleted -and $retryCount -lt $MaxRetries) {
+      try {
+        $response = Invoke-RestMethod -Method GET -Uri $url `
+          -Headers @{ Authorization = "Bearer $tokenString"; ConsistencyLevel = 'eventual' }
+        $requestCompleted = $true
+      } catch {
+        if (Is-ExpiredTokenError -ErrorRecord $_) {
+          Write-RunbookLog -Level 'WARN' -Message 'Graph token expired during paging; refreshing and retrying current page.'
+          $tokenString = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com'
+          # Retry immediately without incrementing retry count for token expiry
+          continue
+        } elseif (Is-ThrottlingError -ErrorRecord $_) {
+          $retryCount++
+          if ($retryCount -ge $MaxRetries) {
+            Write-RunbookLog -Level 'ERROR' -Message "Graph request throttled (429). Max retries ($MaxRetries) exceeded."
+            throw
+          }
+          $waitSeconds = Get-RetryAfterSeconds -ErrorRecord $_ -DefaultSeconds ([Math]::Pow(2, $retryCount - 1))
+          Write-RunbookLog -Level 'WARN' -Message "Graph request throttled (429). Retry $retryCount/$MaxRetries after $waitSeconds seconds."
+          Start-Sleep -Seconds $waitSeconds
+          # Retry the request
+          continue
+        } else {
+          throw
+        }
+      }
     }
-    $url = $response.'@odata.nextLink'
+
+    if (-not $requestCompleted) {
+      throw "Graph request failed after $MaxRetries retries."
+    }
+
+    $valueProp = $response.PSObject.Properties['value']
+    if ($valueProp -and $null -ne $valueProp.Value) {
+      foreach ($item in $valueProp.Value) { $items.Add($item) }
+    } elseif ($response -is [System.Collections.IEnumerable] -and -not ($response -is [string])) {
+      foreach ($item in $response) { $items.Add($item) }
+    }
+
+    $nextLinkProp = $response.PSObject.Properties['@odata.nextLink']
+    if ($nextLinkProp -and -not [string]::IsNullOrWhiteSpace([string]$nextLinkProp.Value)) {
+      $url = [string]$nextLinkProp.Value
+    } else {
+      $url = $null
+    }
   }
 
   return , $items.ToArray()
@@ -125,43 +284,76 @@ function ConvertTo-NormalizedObject {
   #>
   param(
     [Parameter(ValueFromPipeline = $true)]
-    $InputObject
+    $InputObject,
+
+    [int]$CurrentDepth = 0,
+    [int]$MaxDepth = 40,
+    [hashtable]$Visited = $null
   )
+
+  if ($CurrentDepth -ge $MaxDepth) {
+    return '[MaxDepthReached]'
+  }
+
+  if ($null -eq $Visited) {
+    $Visited = @{}
+  }
 
   # Scalar pass-through
   if ($null -eq $InputObject)                      { return $null }
   if ($InputObject -is [bool])                     { return $InputObject }
   if ($InputObject -is [string])                   { return $InputObject }
+  if ($InputObject -is [datetime] -or $InputObject -is [guid]) { return $InputObject }
   if ($InputObject -is [int]   -or
       $InputObject -is [long]  -or
       $InputObject -is [double]-or
       $InputObject -is [decimal]) { return $InputObject }
 
-  # Array / list
-  if ($InputObject -is [System.Collections.IEnumerable] -and
-      -not ($InputObject -is [hashtable]) -and
-      -not ($InputObject -is [string])) {
-    $arr = [System.Collections.Generic.List[object]]::new()
-    foreach ($item in $InputObject) { $arr.Add((ConvertTo-NormalizedObject $item)) }
-    return , $arr.ToArray()
+  $objectId = $null
+  $trackObject = $false
+
+  if (-not ($InputObject -is [ValueType])) {
+    $trackObject = $true
+    $objectId = [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($InputObject)
+    if ($Visited.ContainsKey($objectId)) {
+      return '[CircularReference]'
+    }
+    $Visited[$objectId] = $true
   }
 
-  # Object / hashtable — sort keys and strip OData noise
-  $oDataKeys = '@odata.context', '@odata.nextLink', '@odata.etag',
-               '@odata.type', '@odata.id', '@odata.count'
+  try {
+    # Array / list
+    if ($InputObject -is [System.Collections.IEnumerable] -and
+        -not ($InputObject -is [hashtable]) -and
+        -not ($InputObject -is [string])) {
+      $arr = [System.Collections.Generic.List[object]]::new()
+      foreach ($item in $InputObject) {
+        $arr.Add((ConvertTo-NormalizedObject -InputObject $item -CurrentDepth ($CurrentDepth + 1) -MaxDepth $MaxDepth -Visited $Visited))
+      }
+      return , $arr.ToArray()
+    }
 
-  $sourceKeys = if ($InputObject -is [hashtable]) {
-    $InputObject.Keys
-  } else {
-    $InputObject.PSObject.Properties.Name
-  }
+    # Object / hashtable — sort keys and strip OData noise
+    $oDataKeys = '@odata.context', '@odata.nextLink', '@odata.etag',
+                 '@odata.type', '@odata.id', '@odata.count'
 
-  $sorted = [ordered]@{}
-  foreach ($key in ($sourceKeys | Where-Object { $_ -notin $oDataKeys } | Sort-Object)) {
-    $val = if ($InputObject -is [hashtable]) { $InputObject[$key] } else { $InputObject.$key }
-    $sorted[$key] = ConvertTo-NormalizedObject $val
+    $sourceKeys = if ($InputObject -is [hashtable]) {
+      $InputObject.Keys
+    } else {
+      $InputObject.PSObject.Properties.Name
+    }
+
+    $sorted = [ordered]@{}
+    foreach ($key in ($sourceKeys | Where-Object { $_ -notin $oDataKeys } | Sort-Object)) {
+      $val = if ($InputObject -is [hashtable]) { $InputObject[$key] } else { $InputObject.$key }
+      $sorted[$key] = ConvertTo-NormalizedObject -InputObject $val -CurrentDepth ($CurrentDepth + 1) -MaxDepth $MaxDepth -Visited $Visited
+    }
+    return $sorted
+  } finally {
+    if ($trackObject -and $null -ne $objectId) {
+      [void]$Visited.Remove($objectId)
+    }
   }
-  return $sorted
 }
 
 function Get-TextHash {
@@ -194,16 +386,39 @@ function Build-PolicyMap {
 
   $map = @{}
   foreach ($item in $Items) {
-    $id = [string]$item.id
+    $id = if ($item -is [hashtable]) {
+      [string]$item['id']
+    } else {
+      $idProp = $item.PSObject.Properties['id']
+      if ($idProp) { [string]$idProp.Value } else { '' }
+    }
+
     if ([string]::IsNullOrWhiteSpace($id)) { continue }
 
     # Resolve display name — Graph uses 'name' or 'displayName' depending on endpoint
-    $name = if (-not [string]::IsNullOrWhiteSpace([string]$item.name)) {
-      [string]$item.name
-    } elseif (-not [string]::IsNullOrWhiteSpace([string]$item.displayName)) {
-      [string]$item.displayName
+    $name = if ($item -is [hashtable]) {
+      $candidateName = [string]$item['name']
+      $candidateDisplayName = [string]$item['displayName']
+      if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
+        $candidateName
+      } elseif (-not [string]::IsNullOrWhiteSpace($candidateDisplayName)) {
+        $candidateDisplayName
+      } else {
+        $id
+      }
     } else {
-      $id
+      $nameProp = $item.PSObject.Properties['name']
+      $displayNameProp = $item.PSObject.Properties['displayName']
+      $candidateName = if ($nameProp) { [string]$nameProp.Value } else { '' }
+      $candidateDisplayName = if ($displayNameProp) { [string]$displayNameProp.Value } else { '' }
+
+      if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
+        $candidateName
+      } elseif (-not [string]::IsNullOrWhiteSpace($candidateDisplayName)) {
+        $candidateDisplayName
+      } else {
+        $id
+      }
     }
 
     $normalized = ConvertTo-NormalizedObject $item
@@ -303,24 +518,10 @@ function Get-DriftEvents {
     $prevHt = $prev.normalized | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
     $curHt  = $cur.normalized  | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
 
-    $fieldSet = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($f in $prevHt.Keys) { [void]$fieldSet.Add($f) }
-    foreach ($f in $curHt.Keys)  { [void]$fieldSet.Add($f) }
-
+    $leafDrifts = @(Get-LeafDriftItems -Previous $prevHt -Current $curHt -MaxDepth 20 -MaxDiffs 40)
     $changedFields = [System.Collections.Generic.List[string]]::new()
-    $driftItems    = [System.Collections.Generic.List[hashtable]]::new()
-    foreach ($f in $fieldSet) {
-      $aJson = $prevHt[$f] | ConvertTo-Json -Depth 100 -Compress
-      $bJson = $curHt[$f]  | ConvertTo-Json -Depth 100 -Compress
-      if ($aJson -ne $bJson) {
-        $changedFields.Add($f)
-        $driftItems.Add(@{
-          field          = $f
-          previousValue  = $aJson
-          currentValue   = $bJson
-        })
-        if ($changedFields.Count -ge 40) { break }   # guard against very wide objects
-      }
+    foreach ($entry in $leafDrifts) {
+      $changedFields.Add([string]$entry.field)
     }
 
     $events.Add([pscustomobject]@{
@@ -333,11 +534,172 @@ function Get-DriftEvents {
       previousHash = $prev.hash
       currentHash  = $cur.hash
       changedFields = $changedFields.ToArray()
-      driftItems   = $driftItems.ToArray()
+      driftItems   = $leafDrifts
     })
   }
 
   return , $events.ToArray()
+}
+
+function Add-LeafDiffs {
+  <#
+  .SYNOPSIS Recursively compares two normalized values and appends leaf-level
+            field differences into the provided list.
+  #>
+  param(
+    $Previous,
+    $Current,
+    [string]$Path,
+    [int]$Depth,
+    [int]$MaxDepth,
+    [int]$MaxDiffs,
+    [System.Collections.Generic.List[hashtable]]$Diffs
+  )
+
+  if ($Diffs.Count -ge $MaxDiffs) { return }
+
+  $toJson = {
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    return $Value | ConvertTo-Json -Depth 20 -Compress
+  }
+
+  if ($Depth -ge $MaxDepth) {
+    $aJson = & $toJson $Previous
+    $bJson = & $toJson $Current
+    if ($aJson -ne $bJson) {
+      $Diffs.Add(@{
+        field = if ([string]::IsNullOrWhiteSpace($Path)) { '(root)' } else { $Path }
+        previousValue = $aJson
+        currentValue = $bJson
+      })
+    }
+    return
+  }
+
+  $prevIsObject = $null -ne $Previous -and ($Previous -is [hashtable])
+  $curIsObject  = $null -ne $Current  -and ($Current  -is [hashtable])
+
+  if ($prevIsObject -and $curIsObject) {
+    $keys = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($k in $Previous.Keys) { [void]$keys.Add([string]$k) }
+    foreach ($k in $Current.Keys)  { [void]$keys.Add([string]$k) }
+
+    foreach ($key in ($keys | Sort-Object)) {
+      if ($Diffs.Count -ge $MaxDiffs) { break }
+      $nextPath = if ([string]::IsNullOrWhiteSpace($Path)) { $key } else { "$Path.$key" }
+      Add-LeafDiffs -Previous $Previous[$key] -Current $Current[$key] -Path $nextPath -Depth ($Depth + 1) -MaxDepth $MaxDepth -MaxDiffs $MaxDiffs -Diffs $Diffs
+    }
+    return
+  }
+
+  $prevIsArray = $null -ne $Previous -and ($Previous -is [System.Collections.IEnumerable]) -and -not ($Previous -is [string]) -and -not ($Previous -is [hashtable])
+  $curIsArray  = $null -ne $Current  -and ($Current  -is [System.Collections.IEnumerable]) -and -not ($Current  -is [string]) -and -not ($Current  -is [hashtable])
+
+  if ($prevIsArray -and $curIsArray) {
+    $prevArr = @($Previous)
+    $curArr  = @($Current)
+    $maxLen = [Math]::Max($prevArr.Count, $curArr.Count)
+
+    for ($i = 0; $i -lt $maxLen; $i++) {
+      if ($Diffs.Count -ge $MaxDiffs) { break }
+      $a = if ($i -lt $prevArr.Count) { $prevArr[$i] } else { $null }
+      $b = if ($i -lt $curArr.Count)  { $curArr[$i] } else { $null }
+      $nextPath = if ([string]::IsNullOrWhiteSpace($Path)) { "[$i]" } else { "$Path[$i]" }
+      Add-LeafDiffs -Previous $a -Current $b -Path $nextPath -Depth ($Depth + 1) -MaxDepth $MaxDepth -MaxDiffs $MaxDiffs -Diffs $Diffs
+    }
+    return
+  }
+
+  $left = & $toJson $Previous
+  $right = & $toJson $Current
+  if ($left -ne $right) {
+    $Diffs.Add(@{
+      field = if ([string]::IsNullOrWhiteSpace($Path)) { '(root)' } else { $Path }
+      previousValue = $left
+      currentValue = $right
+    })
+  }
+}
+
+function Get-LeafDriftItems {
+  <#
+  .SYNOPSIS Returns leaf-level drift items with field paths for two normalized
+            hashtable values.
+  #>
+  param(
+    [hashtable]$Previous,
+    [hashtable]$Current,
+    [int]$MaxDepth = 20,
+    [int]$MaxDiffs = 40
+  )
+
+  $diffs = [System.Collections.Generic.List[hashtable]]::new()
+  Add-LeafDiffs -Previous $Previous -Current $Current -Path '' -Depth 0 -MaxDepth $MaxDepth -MaxDiffs $MaxDiffs -Diffs $diffs
+  return , $diffs.ToArray()
+}
+
+function Build-DriftDataJson {
+  <#
+  .SYNOPSIS Builds a size-safe JSON payload for table storage driftData.
+  #>
+  param(
+    $DriftItems,
+    [string]$FallbackPrevious,
+    [string]$FallbackCurrent,
+    [int]$MaxChars = 30000,
+    [int]$MaxItemValueChars = 1200,
+    [int]$MaxItems = 20
+  )
+
+  $truncate = {
+    param([string]$Value, [int]$Limit)
+    if ($null -eq $Value) { return '' }
+    if ($Value.Length -le $Limit) { return $Value }
+    return $Value.Substring(0, $Limit) + '...[truncated]'
+  }
+
+  $sourceItems = if ($null -ne $DriftItems -and @($DriftItems).Count -gt 0) {
+    @($DriftItems)
+  } else {
+    @(@{
+      field         = 'changeType'
+      previousValue = $FallbackPrevious
+      currentValue  = $FallbackCurrent
+    })
+  }
+
+  $safeItems = [System.Collections.Generic.List[hashtable]]::new()
+  foreach ($item in $sourceItems) {
+    if ($safeItems.Count -ge $MaxItems) { break }
+
+    $field = if ($item -is [hashtable]) { [string]$item['field'] } else { [string]$item.field }
+    $previousValue = if ($item -is [hashtable]) { [string]$item['previousValue'] } else { [string]$item.previousValue }
+    $currentValue = if ($item -is [hashtable]) { [string]$item['currentValue'] } else { [string]$item.currentValue }
+
+    if ([string]::IsNullOrWhiteSpace($field)) { $field = 'unknown' }
+
+    $safeItems.Add(@{
+      field         = (& $truncate $field 300)
+      previousValue = (& $truncate $previousValue $MaxItemValueChars)
+      currentValue  = (& $truncate $currentValue $MaxItemValueChars)
+    })
+  }
+
+  $json = $safeItems | ConvertTo-Json -Compress
+  while ($json.Length -gt $MaxChars -and $safeItems.Count -gt 1) {
+    $safeItems.RemoveAt($safeItems.Count - 1)
+    $json = $safeItems | ConvertTo-Json -Compress
+  }
+
+  if ($json.Length -gt $MaxChars -and $safeItems.Count -eq 1) {
+    $single = $safeItems[0]
+    $single['previousValue'] = (& $truncate ([string]$single['previousValue']) 400)
+    $single['currentValue'] = (& $truncate ([string]$single['currentValue']) 400)
+    $json = @($single) | ConvertTo-Json -Compress
+  }
+
+  return $json
 }
 
 function Write-StorageBlob {
@@ -345,21 +707,38 @@ function Write-StorageBlob {
   .SYNOPSIS Writes UTF-8 text as a BlockBlob via Azure Blob Storage REST API.
   #>
   param(
-    [Parameter(Mandatory = $true)] [string]$Token,
+    [Parameter(Mandatory = $true)] $Token,
     [Parameter(Mandatory = $true)] [string]$BlobPath,
     [Parameter(Mandatory = $true)] [string]$Text,
     [string]$ContentType = 'application/json; charset=utf-8'
   )
 
+  $tokenString = ConvertTo-TokenString -TokenValue $Token
+
   $uri   = "https://$StorageAccountName.blob.core.windows.net/$ContainerName/$BlobPath"
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
 
-  Invoke-RestMethod -Method PUT -Uri $uri -Headers @{
-    Authorization     = "Bearer $Token"
-    'x-ms-version'    = '2021-12-02'
-    'x-ms-blob-type'  = 'BlockBlob'
-    'Content-Type'    = $ContentType
-  } -Body $bytes | Out-Null
+  try {
+    Invoke-RestMethod -Method PUT -Uri $uri -Headers @{
+      Authorization     = "Bearer $tokenString"
+      'x-ms-version'    = '2021-12-02'
+      'x-ms-blob-type'  = 'BlockBlob'
+      'Content-Type'    = $ContentType
+    } -Body $bytes | Out-Null
+  } catch {
+    if (Is-ExpiredTokenError -ErrorRecord $_) {
+      Write-RunbookLog -Level 'WARN' -Message 'Storage token expired during blob write; refreshing and retrying.'
+      $tokenString = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com'
+      Invoke-RestMethod -Method PUT -Uri $uri -Headers @{
+        Authorization     = "Bearer $tokenString"
+        'x-ms-version'    = '2021-12-02'
+        'x-ms-blob-type'  = 'BlockBlob'
+        'Content-Type'    = $ContentType
+      } -Body $bytes | Out-Null
+    } else {
+      throw
+    }
+  }
 }
 
 function Write-TableEntity {
@@ -367,21 +746,56 @@ function Write-TableEntity {
   .SYNOPSIS Inserts a new row into an Azure Table Storage table via REST API.
   #>
   param(
-    [Parameter(Mandatory = $true)] [string]$Token,
+    [Parameter(Mandatory = $true)] $Token,
     [Parameter(Mandatory = $true)] [string]$TableName,
     [Parameter(Mandatory = $true)] [hashtable]$Entity
   )
 
+  $tokenString = ConvertTo-TokenString -TokenValue $Token
+
   $uri = "https://$StorageAccountName.table.core.windows.net/$TableName"
-  Invoke-RestMethod -Method POST -Uri $uri -Headers @{
-    Authorization        = "Bearer $Token"
-    'x-ms-version'       = '2019-02-02'
-    Accept               = 'application/json;odata=nometadata'
-    DataServiceVersion   = '3.0'
-    MaxDataServiceVersion = '3.0'
-    'Content-Type'       = 'application/json;odata=nometadata'
-    Prefer               = 'return-no-content'
-  } -Body ($Entity | ConvertTo-Json -Depth 100 -Compress) | Out-Null
+  $payload = $Entity | ConvertTo-Json -Depth 100 -Compress
+
+  try {
+    Invoke-RestMethod -Method POST -Uri $uri -Headers @{
+      Authorization        = "Bearer $tokenString"
+      'x-ms-version'       = '2019-02-02'
+      Accept               = 'application/json;odata=nometadata'
+      DataServiceVersion   = '3.0'
+      MaxDataServiceVersion = '3.0'
+      'Content-Type'       = 'application/json;odata=nometadata'
+      Prefer               = 'return-no-content'
+    } -Body $payload | Out-Null
+  } catch {
+    if (Is-ExpiredTokenError -ErrorRecord $_) {
+      Write-RunbookLog -Level 'WARN' -Message "Storage token expired during table write to '$TableName'; refreshing and retrying."
+      $tokenString = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com'
+      Invoke-RestMethod -Method POST -Uri $uri -Headers @{
+        Authorization        = "Bearer $tokenString"
+        'x-ms-version'       = '2019-02-02'
+        Accept               = 'application/json;odata=nometadata'
+        DataServiceVersion   = '3.0'
+        MaxDataServiceVersion = '3.0'
+        'Content-Type'       = 'application/json;odata=nometadata'
+        Prefer               = 'return-no-content'
+      } -Body $payload | Out-Null
+      return
+    }
+
+    $statusCode = 'unknown'
+    $responseBody = ''
+    if ($_.Exception.Response) {
+      try { $statusCode = [string][int]$_.Exception.Response.StatusCode } catch {}
+      try {
+        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+        $responseBody = $reader.ReadToEnd()
+        $reader.Dispose()
+      } catch {}
+    }
+
+    $preview = if ($payload.Length -gt 1200) { $payload.Substring(0, 1200) + '...[truncated]' } else { $payload }
+    throw "Table write failed for '$TableName' (HTTP $statusCode). Response: $responseBody PayloadPreview: $preview"
+  }
 }
 
 function New-AuditRow {
@@ -414,38 +828,78 @@ function New-AuditRow {
 
 #region ── Main ────────────────────────────────────────────────────────────────
 
-Write-Output "=== Detect-PolicyDrift  $(Get-Date -Format 'u') ==="
+Write-RunbookLog -Message "=== Detect-PolicyDrift $(Get-Date -Format 'u') version=$ScriptVersion ==="
+Write-RunbookLog -Message "Input parameters: TenantId='$TenantId' StorageAccountName='$StorageAccountName' ContainerName='$ContainerName' GraphBaseUrl='$GraphBaseUrl' BaselinePrefix='$BaselinePrefix' ChangesPrefix='$ChangesPrefix' TempPrefix='$TempPrefix'"
+
+try {
+  $azAccessTokenCmd = Get-Command Get-AzAccessToken -ErrorAction Stop
+  $source = if ($azAccessTokenCmd.Source) { $azAccessTokenCmd.Source } else { 'unknown' }
+  Write-RunbookLog -Message "Get-AzAccessToken command type '$($azAccessTokenCmd.CommandType)' source '$source'."
+} catch {
+  Write-RunbookLog -Level 'WARN' -Message 'Could not resolve Get-AzAccessToken command metadata.'
+  Write-ExceptionDetails -ErrorRecord $_
+}
 
 # ── 1. Authenticate ──────────────────────────────────────────────────────────
-Write-Output "Authenticating with managed identity..."
-Disable-AzContextAutosave -Scope Process | Out-Null
-Connect-AzAccount -Identity | Out-Null
+Write-RunbookLog -Message 'Authenticating with managed identity...'
+try {
+  Disable-AzContextAutosave -Scope Process | Out-Null
+  Write-RunbookLog -Level 'DEBUG' -Message 'Disable-AzContextAutosave completed.'
+  Connect-AzAccount -Identity | Out-Null
+  Write-RunbookLog -Level 'DEBUG' -Message 'Connect-AzAccount -Identity completed.'
+} catch {
+  Write-RunbookLog -Level 'ERROR' -Message 'Managed identity authentication failed.'
+  Write-ExceptionDetails -ErrorRecord $_
+  throw
+}
 
-$graphToken   = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com'
-$storageToken = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com'
+Write-RunbookLog -Level 'DEBUG' -Message 'Attempting to acquire Graph token...'
+try {
+  $graphToken = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com'
+  Write-RunbookLog -Level 'DEBUG' -Message "Graph token acquired. Type: $($graphToken.GetType().FullName)"
+} catch {
+  Write-RunbookLog -Level 'ERROR' -Message 'Failed to acquire Graph token.'
+  Write-ExceptionDetails -ErrorRecord $_
+  throw
+}
+
+Write-RunbookLog -Level 'DEBUG' -Message 'Attempting to acquire Storage token...'
+try {
+  $storageToken = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com'
+  Write-RunbookLog -Level 'DEBUG' -Message "Storage token acquired. Type: $($storageToken.GetType().FullName)"
+} catch {
+  Write-RunbookLog -Level 'ERROR' -Message 'Failed to acquire Storage token.'
+  Write-ExceptionDetails -ErrorRecord $_
+  throw
+}
+
 $now          = [DateTime]::UtcNow
 $stamp        = $now.ToString('yyyyMMddTHHmmssZ')
 $nowIso       = $now.ToString('o')
 
 # ── 2. Collect live policy data from Graph ───────────────────────────────────
-Write-Output "Querying Microsoft Graph for Intune policies..."
+Write-RunbookLog -Message 'Querying Microsoft Graph for Intune policies...'
 try {
-  $configPolicies  = Invoke-GraphPagedGet -Path '/beta/deviceManagement/configurationPolicies?$top=999' -Token $graphToken
+  $configPolicies  = Invoke-GraphPagedGet -Path '/beta/deviceManagement/configurationPolicies?$top=999&$expand=settings' -Token $graphToken
   $deviceConfigs   = Invoke-GraphPagedGet -Path '/v1.0/deviceManagement/deviceConfigurations?$top=999'  -Token $graphToken
   $securityPolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/intents?$top=999'               -Token $graphToken
 } catch {
   $errMsg = "Graph query failed: $_"
-  Write-Error $errMsg
-  Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-    -Note          $errMsg `
-    -DriftSummary  'Run failed — Graph query error' `
-    -Timestamp     $nowIso)
+  Write-RunbookLog -Level 'ERROR' -Message $errMsg
+  try {
+    Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
+      -Note          $errMsg `
+      -DriftSummary  'Run failed — Graph query error' `
+      -Timestamp     $nowIso)
+  } catch {
+    Write-RunbookLog -Level 'WARN' -Message "Failed to write Graph error audit row: $($_.Exception.Message)"
+  }
   throw
 }
 
-Write-Output "  configurationPolicies : $($configPolicies.Count)"
-Write-Output "  deviceConfigurations  : $($deviceConfigs.Count)"
-Write-Output "  security intents      : $($securityPolicies.Count)"
+Write-RunbookLog -Message "  configurationPolicies : $($configPolicies.Count)"
+Write-RunbookLog -Message "  deviceConfigurations  : $($deviceConfigs.Count)"
+Write-RunbookLog -Message "  security intents      : $($securityPolicies.Count)"
 
 # ── 3. Build normalised current-state map ────────────────────────────────────
 $currentMap = Merge-PolicyMaps -Maps @(
@@ -453,7 +907,7 @@ $currentMap = Merge-PolicyMaps -Maps @(
   (Build-PolicyMap -PolicyType 'device'        -Items $deviceConfigs),
   (Build-PolicyMap -PolicyType 'security'      -Items $securityPolicies)
 )
-Write-Output "Total policies in scope: $($currentMap.Count)"
+Write-RunbookLog -Message "Total policies in scope: $($currentMap.Count)"
 
 $currentSnapshot = [ordered]@{
   capturedAt   = $nowIso
@@ -482,29 +936,33 @@ try {
   # 404 = no baseline yet; any other error re-throws below after logging
   if ($_.Exception.Response.StatusCode.value__ -ne 404) {
     $errMsg = "Baseline HEAD check failed: $_"
-    Write-Error $errMsg
-    Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-      -Note         $errMsg `
-      -DriftSummary 'Run failed — baseline read error' `
-      -Timestamp    $nowIso)
+    Write-RunbookLog -Level 'ERROR' -Message $errMsg
+    try {
+      Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
+        -Note         $errMsg `
+        -DriftSummary 'Run failed — baseline read error' `
+        -Timestamp    $nowIso)
+    } catch {
+      Write-RunbookLog -Level 'WARN' -Message "Failed to write baseline error audit row: $($_.Exception.Message)"
+    }
     throw
   }
 }
 
 # ── 5. First run — establish baseline ───────────────────────────────────────
 if (-not $baselineExists) {
-  Write-Output "No baseline found. Establishing initial baseline..."
+  Write-RunbookLog -Message 'No baseline found. Establishing initial baseline...'
   Write-StorageBlob -Token $storageToken -BlobPath $baselinePath -Text $currentSnapshotJson
   Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
     -Note         'Initial baseline established.' `
     -DriftSummary "Baseline created with $($currentMap.Count) policies" `
     -Timestamp    $nowIso)
-  Write-Output "Baseline created — run complete."
+  Write-RunbookLog -Message 'Baseline created - run complete.'
   return
 }
 
 # ── 6. Read stored baseline ──────────────────────────────────────────────────
-Write-Output "Reading stored baseline for comparison..."
+Write-RunbookLog -Message 'Reading stored baseline for comparison...'
 $baselineResponse = Invoke-WebRequest -Method GET -Uri $baselineUri -Headers @{
   Authorization  = "Bearer $storageToken"
   'x-ms-version' = '2021-12-02'
@@ -517,7 +975,7 @@ $events = Get-DriftEvents -Baseline $baselineMap -Current $currentMap -Timestamp
 
 # ── 8a. No drift — write heartbeat and exit ──────────────────────────────────
 if ($events.Count -eq 0) {
-  Write-Output "No drift detected. Writing heartbeat."
+  Write-RunbookLog -Message 'No drift detected. Writing heartbeat.'
   Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
     -Note         'Baseline compare complete — no changes.' `
     -DriftSummary "0 changes across $($currentMap.Count) policies" `
@@ -526,7 +984,7 @@ if ($events.Count -eq 0) {
 }
 
 # ── 8b. Drift detected — persist artifacts and table rows ────────────────────
-Write-Output "Drift detected: $($events.Count) event(s). Persisting artifacts..."
+Write-RunbookLog -Message "Drift detected: $($events.Count) event(s). Persisting artifacts..."
 $changesRoot = "$ChangesPrefix/$stamp"
 
 foreach ($event in $events) {
@@ -555,16 +1013,10 @@ foreach ($event in $events) {
   # One TenantPolicyDriftEvents row per changed policy.
   # driftData serialises as a JSON array of {field, previousValue, currentValue}
   # matching the PolicyDriftItem interface consumed by the React app.
-  $driftDataJson = if ($event.driftItems.Count -gt 0) {
-    $event.driftItems | ConvertTo-Json -Depth 10 -Compress
-  } else {
-    # added / removed have no field-level diff — emit a single summary item
-    @(@{
-      field         = 'changeType'
-      previousValue = $event.previousHash
-      currentValue  = $event.currentHash
-    }) | ConvertTo-Json -Compress
-  }
+  $driftDataJson = Build-DriftDataJson `
+    -DriftItems $event.driftItems `
+    -FallbackPrevious $event.previousHash `
+    -FallbackCurrent $event.currentHash
 
   Write-TableEntity -Token $storageToken -TableName 'TenantPolicyDriftEvents' -Entity @{
     PartitionKey  = $TenantId
@@ -580,7 +1032,7 @@ foreach ($event in $events) {
     timestamp     = $nowIso
   }
 
-  Write-Output "  [$($event.changeType.ToUpper())] $($event.policyType):$($event.policyId) — $($event.policyName)"
+  Write-RunbookLog -Message "  [$($event.changeType.ToUpper())] $($event.policyType):$($event.policyId) - $($event.policyName)"
 }
 
 # Run index blob (human-readable summary of the run)
@@ -605,9 +1057,9 @@ Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (Ne
 # ── 9. Roll the baseline forward ─────────────────────────────────────────────
 # Writing the current snapshot as the new baseline means the next scheduled run
 # only surfaces policies that changed *after* this run — not the same ones again.
-Write-Output "Rolling baseline forward to current snapshot..."
+Write-RunbookLog -Message 'Rolling baseline forward to current snapshot...'
 Write-StorageBlob -Token $storageToken -BlobPath $baselinePath -Text $currentSnapshotJson
 
-Write-Output "=== Run complete. $($events.Count) drift event(s) recorded. ==="
+Write-RunbookLog -Message "=== Run complete. $($events.Count) drift event(s) recorded. ==="
 
 #endregion
