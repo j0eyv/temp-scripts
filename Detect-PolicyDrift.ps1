@@ -221,6 +221,7 @@ function Invoke-GraphPagedGet {
 
   $url   = "$GraphBaseUrl$Path"
   $items = [System.Collections.Generic.List[object]]::new()
+  $pageCount = 0
 
   while ($url) {
     $retryCount = 0
@@ -258,22 +259,76 @@ function Invoke-GraphPagedGet {
       throw "Graph request failed after $MaxRetries retries."
     }
 
-    $valueProp = $response.PSObject.Properties['value']
-    if ($valueProp -and $null -ne $valueProp.Value) {
-      foreach ($item in $valueProp.Value) { $items.Add($item) }
+    $pageCount++
+
+    $value = $null
+    if ($response -is [hashtable] -and $response.ContainsKey('value')) {
+      $value = $response['value']
+    } else {
+      $valueProp = $response.PSObject.Properties['value']
+      if ($valueProp) {
+        $value = $valueProp.Value
+      }
+    }
+
+    if ($null -ne $value) {
+      foreach ($item in $value) { $items.Add($item) }
     } elseif ($response -is [System.Collections.IEnumerable] -and -not ($response -is [string])) {
       foreach ($item in $response) { $items.Add($item) }
     }
 
-    $nextLinkProp = $response.PSObject.Properties['@odata.nextLink']
-    if ($nextLinkProp -and -not [string]::IsNullOrWhiteSpace([string]$nextLinkProp.Value)) {
-      $url = [string]$nextLinkProp.Value
+    $nextLink = $null
+    if ($response -is [hashtable]) {
+      if ($response.ContainsKey('@odata.nextLink')) {
+        $nextLink = [string]$response['@odata.nextLink']
+      } elseif ($response.ContainsKey('odata.nextLink')) {
+        $nextLink = [string]$response['odata.nextLink']
+      }
+    } else {
+      $nextLinkProp = $response.PSObject.Properties['@odata.nextLink']
+      if (-not $nextLinkProp) {
+        $nextLinkProp = $response.PSObject.Properties['odata.nextLink']
+      }
+      if ($nextLinkProp) {
+        $nextLink = [string]$nextLinkProp.Value
+      }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($nextLink)) {
+      $url = $nextLink
     } else {
       $url = $null
     }
   }
 
+  Write-RunbookLog -Level 'DEBUG' -Message "Graph collection '$Path' pages: $pageCount, items: $($items.Count)"
+
   return , $items.ToArray()
+}
+
+function Get-PolicyTypeCounts {
+  <#
+  .SYNOPSIS Returns a hashtable with policy counts by policyType from a policy map.
+  #>
+  param(
+    [Parameter(Mandatory = $true)] [hashtable]$PolicyMap
+  )
+
+  $counts = @{
+    configuration = 0
+    device        = 0
+    security      = 0
+    compliance    = 0
+  }
+
+  foreach ($entry in $PolicyMap.Values) {
+    $type = [string]$entry.policyType
+    if ($counts.ContainsKey($type)) {
+      $counts[$type] = [int]$counts[$type] + 1
+    }
+  }
+
+  return $counts
 }
 
 function ConvertTo-NormalizedObject {
@@ -983,6 +1038,29 @@ $baselineResponse = Invoke-WebRequest -Method GET -Uri $baselineUri -Headers @{
 }
 $baseline    = ([string]$baselineResponse.Content) | ConvertFrom-Json -AsHashtable
 $baselineMap = $baseline.policies   # hashtable keyed by "<type>:<id>"
+
+# Guardrail: if current snapshot is unexpectedly much smaller than baseline,
+# skip drift projection to avoid false mass-removals from partial Graph reads.
+$baselineCounts = Get-PolicyTypeCounts -PolicyMap $baselineMap
+$currentCounts  = Get-PolicyTypeCounts -PolicyMap $currentMap
+
+Write-RunbookLog -Message "Baseline policy counts: configuration=$($baselineCounts.configuration), device=$($baselineCounts.device), security=$($baselineCounts.security), compliance=$($baselineCounts.compliance), total=$($baselineMap.Count)"
+Write-RunbookLog -Message "Current policy counts : configuration=$($currentCounts.configuration), device=$($currentCounts.device), security=$($currentCounts.security), compliance=$($currentCounts.compliance), total=$($currentMap.Count)"
+
+$currentCoverage = if ($baselineMap.Count -gt 0) { [double]$currentMap.Count / [double]$baselineMap.Count } else { 1.0 }
+$isSuspiciousDrop = $baselineMap.Count -ge 50 -and $currentCoverage -lt 0.6
+
+if ($isSuspiciousDrop) {
+  $coveragePct = [Math]::Round($currentCoverage * 100, 2)
+  $warnMessage = "Snapshot integrity check failed: current snapshot has $($currentMap.Count) policies vs baseline $($baselineMap.Count) (${coveragePct}% coverage). Skipping drift projection to prevent false removals."
+  Write-RunbookLog -Level 'WARN' -Message $warnMessage
+  Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
+    -Note         $warnMessage `
+    -DriftSummary 'Run skipped — incomplete Graph snapshot' `
+    -DriftData    (@{ baselineCount = $baselineMap.Count; currentCount = $currentMap.Count; coverage = $currentCoverage } | ConvertTo-Json -Compress) `
+    -Timestamp    $nowIso)
+  return
+}
 
 # ── 7. Compute drift ─────────────────────────────────────────────────────────
 $events = Get-DriftEvents -Baseline $baselineMap -Current $currentMap -Timestamp $nowIso
