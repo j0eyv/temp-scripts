@@ -262,32 +262,56 @@ function Invoke-GraphPagedGet {
     $pageCount++
 
     $value = $null
-    if ($response -is [hashtable] -and $response.ContainsKey('value')) {
-      $value = $response['value']
-    } else {
+    if ($response -is [System.Collections.IDictionary]) {
+      foreach ($key in $response.Keys) {
+        if ([string]$key -ieq 'value') {
+          $value = $response[$key]
+          break
+        }
+      }
+    }
+
+    if ($null -eq $value) {
       $valueProp = $response.PSObject.Properties['value']
+      if (-not $valueProp) {
+        $valueProp = $response.PSObject.Properties['Value']
+      }
       if ($valueProp) {
         $value = $valueProp.Value
       }
     }
 
     if ($null -ne $value) {
-      foreach ($item in $value) { $items.Add($item) }
-    } elseif ($response -is [System.Collections.IEnumerable] -and -not ($response -is [string])) {
+      if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
+        foreach ($item in $value) { $items.Add($item) }
+      } else {
+        # Defensive fallback: Graph collection payload should always be an array.
+        # If it is not, still add the single object so the run doesn't silently drop it.
+        $items.Add($value)
+      }
+    } elseif (
+      $response -is [System.Collections.IEnumerable] -and
+      -not ($response -is [string]) -and
+      -not ($response -is [System.Collections.IDictionary])
+    ) {
       foreach ($item in $response) { $items.Add($item) }
     }
 
     $nextLink = $null
-    if ($response -is [hashtable]) {
-      if ($response.ContainsKey('@odata.nextLink')) {
-        $nextLink = [string]$response['@odata.nextLink']
-      } elseif ($response.ContainsKey('odata.nextLink')) {
-        $nextLink = [string]$response['odata.nextLink']
+    if ($response -is [System.Collections.IDictionary]) {
+      foreach ($key in $response.Keys) {
+        if ([string]$key -ieq '@odata.nextLink' -or [string]$key -ieq 'odata.nextLink') {
+          $nextLink = [string]$response[$key]
+          break
+        }
       }
     } else {
       $nextLinkProp = $response.PSObject.Properties['@odata.nextLink']
       if (-not $nextLinkProp) {
         $nextLinkProp = $response.PSObject.Properties['odata.nextLink']
+      }
+      if (-not $nextLinkProp) {
+        $nextLinkProp = $response.PSObject.Properties['@odata.nextlink']
       }
       if ($nextLinkProp) {
         $nextLink = [string]$nextLinkProp.Value
@@ -976,6 +1000,23 @@ $currentMap = Merge-PolicyMaps -Maps @(
   (Build-PolicyMap -PolicyType 'security'      -Items $securityPolicies),
   (Build-PolicyMap -PolicyType 'compliance'    -Items $compliancePolicies)
 )
+
+$rawGraphTotal = $configPolicies.Count + $deviceConfigs.Count + $securityPolicies.Count + $compliancePolicies.Count
+if ($rawGraphTotal -gt 0 -and $currentMap.Count -eq 0) {
+  $shapeError = 'Graph payload parse mismatch: endpoint counts were non-zero but normalized policy map is empty. Aborting to avoid creating an invalid baseline.'
+  Write-RunbookLog -Level 'ERROR' -Message $shapeError
+  try {
+    Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
+      -Note         $shapeError `
+      -DriftSummary 'Run failed — graph payload parse mismatch' `
+      -DriftData    (@{ configuration = $configPolicies.Count; device = $deviceConfigs.Count; security = $securityPolicies.Count; compliance = $compliancePolicies.Count } | ConvertTo-Json -Compress) `
+      -Timestamp    $nowIso)
+  } catch {
+    Write-RunbookLog -Level 'WARN' -Message "Failed to write payload-shape error audit row: $($_.Exception.Message)"
+  }
+  throw $shapeError
+}
+
 Write-RunbookLog -Message "Total policies in scope: $($currentMap.Count)"
 
 $currentSnapshot = [ordered]@{
