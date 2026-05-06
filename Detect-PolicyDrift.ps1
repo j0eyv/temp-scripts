@@ -72,7 +72,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$ScriptVersion = '2.11-debug'
+$ScriptVersion = '2.12-debug'
 $VerbosePreference = 'Continue'
 
 function Write-RunbookLog {
