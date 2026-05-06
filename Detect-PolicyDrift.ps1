@@ -480,7 +480,7 @@ function ConvertTo-NormalizedObject {
   try {
     # Array / list
     if ($InputObject -is [System.Collections.IEnumerable] -and
-        -not ($InputObject -is [hashtable]) -and
+      -not ($InputObject -is [System.Collections.IDictionary]) -and
         -not ($InputObject -is [string])) {
       $arr = [System.Collections.Generic.List[object]]::new()
       foreach ($item in $InputObject) {
@@ -493,7 +493,7 @@ function ConvertTo-NormalizedObject {
     $oDataKeys = '@odata.context', '@odata.nextLink', '@odata.etag',
                  '@odata.type', '@odata.id', '@odata.count'
 
-    $sourceKeys = if ($InputObject -is [hashtable]) {
+    $sourceKeys = if ($InputObject -is [System.Collections.IDictionary]) {
       $InputObject.Keys
     } else {
       $InputObject.PSObject.Properties.Name
@@ -501,7 +501,7 @@ function ConvertTo-NormalizedObject {
 
     $sorted = [ordered]@{}
     foreach ($key in ($sourceKeys | Where-Object { $_ -notin $oDataKeys } | Sort-Object)) {
-      $val = if ($InputObject -is [hashtable]) { $InputObject[$key] } else { $InputObject.$key }
+      $val = if ($InputObject -is [System.Collections.IDictionary]) { $InputObject[$key] } else { $InputObject.$key }
       $sorted[$key] = ConvertTo-NormalizedObject -InputObject $val -CurrentDepth ($CurrentDepth + 1) -MaxDepth $MaxDepth -Visited $Visited
     }
     return $sorted
@@ -540,10 +540,20 @@ function Build-PolicyMap {
     [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [array]$Items
   )
 
+  $getDictValue = {
+    param([System.Collections.IDictionary]$Dict, [string]$Key)
+    foreach ($k in $Dict.Keys) {
+      if ([string]$k -ieq $Key) {
+        return $Dict[$k]
+      }
+    }
+    return $null
+  }
+
   $map = @{}
   foreach ($item in $Items) {
-    $id = if ($item -is [hashtable]) {
-      [string]$item['id']
+    $id = if ($item -is [System.Collections.IDictionary]) {
+      [string](& $getDictValue $item 'id')
     } else {
       $idProp = $item.PSObject.Properties['id']
       if ($idProp) { [string]$idProp.Value } else { '' }
@@ -552,9 +562,9 @@ function Build-PolicyMap {
     if ([string]::IsNullOrWhiteSpace($id)) { continue }
 
     # Resolve display name — Graph uses 'name' or 'displayName' depending on endpoint
-    $name = if ($item -is [hashtable]) {
-      $candidateName = [string]$item['name']
-      $candidateDisplayName = [string]$item['displayName']
+    $name = if ($item -is [System.Collections.IDictionary]) {
+      $candidateName = [string](& $getDictValue $item 'name')
+      $candidateDisplayName = [string](& $getDictValue $item 'displayName')
       if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
         $candidateName
       } elseif (-not [string]::IsNullOrWhiteSpace($candidateDisplayName)) {
@@ -733,8 +743,8 @@ function Add-LeafDiffs {
     return
   }
 
-  $prevIsObject = $null -ne $Previous -and ($Previous -is [hashtable])
-  $curIsObject  = $null -ne $Current  -and ($Current  -is [hashtable])
+  $prevIsObject = $null -ne $Previous -and ($Previous -is [System.Collections.IDictionary])
+  $curIsObject  = $null -ne $Current  -and ($Current  -is [System.Collections.IDictionary])
 
   if ($prevIsObject -and $curIsObject) {
     $keys = [System.Collections.Generic.HashSet[string]]::new()
@@ -749,8 +759,8 @@ function Add-LeafDiffs {
     return
   }
 
-  $prevIsArray = $null -ne $Previous -and ($Previous -is [System.Collections.IEnumerable]) -and -not ($Previous -is [string]) -and -not ($Previous -is [hashtable])
-  $curIsArray  = $null -ne $Current  -and ($Current  -is [System.Collections.IEnumerable]) -and -not ($Current  -is [string]) -and -not ($Current  -is [hashtable])
+  $prevIsArray = $null -ne $Previous -and ($Previous -is [System.Collections.IEnumerable]) -and -not ($Previous -is [string]) -and -not ($Previous -is [System.Collections.IDictionary])
+  $curIsArray  = $null -ne $Current  -and ($Current  -is [System.Collections.IEnumerable]) -and -not ($Current  -is [string]) -and -not ($Current  -is [System.Collections.IDictionary])
 
   if ($prevIsArray -and $curIsArray) {
     $prevArr = @($Previous)
