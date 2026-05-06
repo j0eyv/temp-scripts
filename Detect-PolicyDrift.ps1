@@ -880,9 +880,21 @@ $nowIso       = $now.ToString('o')
 # ── 2. Collect live policy data from Graph ───────────────────────────────────
 Write-RunbookLog -Message 'Querying Microsoft Graph for Intune policies...'
 try {
-  $configPolicies  = Invoke-GraphPagedGet -Path '/beta/deviceManagement/configurationPolicies?$top=999&$expand=settings' -Token $graphToken
-  $deviceConfigs   = Invoke-GraphPagedGet -Path '/v1.0/deviceManagement/deviceConfigurations?$top=999'  -Token $graphToken
-  $securityPolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/intents?$top=999'               -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching configuration policies...'
+  $configPolicies  = Invoke-GraphPagedGet -Path '/beta/deviceManagement/configurationPolicies?$top=999' -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Configuration policies returned: $($configPolicies.Count)"
+  
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching device configurations...'
+  $deviceConfigs   = Invoke-GraphPagedGet -Path '/v1.0/deviceManagement/deviceConfigurations?$top=999' -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Device configurations returned: $($deviceConfigs.Count)"
+  
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching security intents...'
+  $securityPolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/intents?$top=999' -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Security intents returned: $($securityPolicies.Count)"
+  
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching security compliance policies...'
+  $compliancePolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/deviceCompliancePolicies?$top=999' -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Compliance policies returned: $($compliancePolicies.Count)"
 } catch {
   $errMsg = "Graph query failed: $_"
   Write-RunbookLog -Level 'ERROR' -Message $errMsg
@@ -900,12 +912,14 @@ try {
 Write-RunbookLog -Message "  configurationPolicies : $($configPolicies.Count)"
 Write-RunbookLog -Message "  deviceConfigurations  : $($deviceConfigs.Count)"
 Write-RunbookLog -Message "  security intents      : $($securityPolicies.Count)"
+Write-RunbookLog -Message "  compliance policies   : $($compliancePolicies.Count)"
 
 # ── 3. Build normalised current-state map ────────────────────────────────────
 $currentMap = Merge-PolicyMaps -Maps @(
   (Build-PolicyMap -PolicyType 'configuration' -Items $configPolicies),
   (Build-PolicyMap -PolicyType 'device'        -Items $deviceConfigs),
-  (Build-PolicyMap -PolicyType 'security'      -Items $securityPolicies)
+  (Build-PolicyMap -PolicyType 'security'      -Items $securityPolicies),
+  (Build-PolicyMap -PolicyType 'compliance'    -Items $compliancePolicies)
 )
 Write-RunbookLog -Message "Total policies in scope: $($currentMap.Count)"
 
