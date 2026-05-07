@@ -1,980 +1,254 @@
-<#
-.SYNOPSIS
-  Detects configuration drift across Microsoft Intune policies and persists results to Azure Storage.
-
-.DESCRIPTION
-  Detect-PolicyDrift.ps1 is an Azure Automation PowerShell 7.2 runbook that:
-    1. Authenticates using the Automation Account's system-assigned managed identity.
-    2. Reads all Intune configuration policies, device configurations, and endpoint
-       security intents from Microsoft Graph.
-    3. On first run, stores a normalised baseline snapshot to Azure Blob Storage.
-    4. On subsequent runs, compares the live policy state against the stored baseline
-       and writes one TenantPolicyDriftEvents table entity per changed policy.
-    5. Writes a heartbeat / summary row to TenantAuditTrail on every run.
-    6. Saves a per-run changes index and individual changed-policy blobs under
-       changes/<timestamp>/ for historical audit purposes.
-    7. Rolls the baseline forward to the current snapshot after recording drift so
-       that the next run only surfaces new changes.
-
-  Required RBAC assignments on the Automation Account managed identity:
-    - Storage Table Data Contributor  (scope: storage account)
-    - Storage Blob Data Contributor   (scope: storage account)
-    - DeviceManagementConfiguration.Read.All (Microsoft Graph application permission)
-
-.PARAMETER TenantId
-  The Entra ID tenant identifier.  Used as PartitionKey in all table
-  entities so rows are scoped per tenant.
-
-.PARAMETER StorageAccountName
-  Name of the Azure Storage account that holds the policy-drift blob container
-  and the TenantAuditTrail / TenantPolicyDriftEvents tables.
-
-.PARAMETER ContainerName
-  Blob container that stores baseline and change artifacts.  Defaults to 'policy-drift'.
-
-.PARAMETER GraphBaseUrl
-  Microsoft Graph base URL.  Override for sovereign clouds, e.g.
-  'https://graph.microsoft.us'.  Defaults to 'https://graph.microsoft.com'.
-
-.PARAMETER BaselinePrefix
-  Virtual folder inside the container for baseline blobs.  Defaults to 'baseline'.
-
-.PARAMETER ChangesPrefix
-  Virtual folder inside the container for per-run change artifacts.  Defaults to 'changes'.
-
-.PARAMETER TempPrefix
-  Virtual folder inside the container for in-flight snapshots.  Defaults to 'temp'.
-
-.NOTES
-  Runtime : PowerShell 7.2 (Azure Automation)
-  Modules : Az.Accounts (bundled with Azure Automation runtime)
-  Author  : inchange drift-detection pipeline
-  Version : 2.0
-#>
-
-[CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$TenantId,
-
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$StorageAccountName,
-
-  [string]$ContainerName  = 'policy-drift',
-  [string]$GraphBaseUrl   = 'https://graph.microsoft.com',
-  [string]$BaselinePrefix = 'baseline',
-  [string]$ChangesPrefix  = 'changes',
-  [string]$TempPrefix     = 'temp'
+  [Parameter(Mandatory = $true)] [string]$TenantId,
+  [Parameter(Mandatory = $true)] [string]$StorageAccountName,
+  [Parameter(Mandatory = $false)] [string]$ContainerName = 'policy-drift',
+  [Parameter(Mandatory = $false)] [string]$GraphBaseUrl = 'https://graph.microsoft.com',
+  [Parameter(Mandatory = $false)] [string]$BaselinePrefix = 'baseline',
+  [Parameter(Mandatory = $false)] [string]$ChangesPrefix = 'changes',
+  [Parameter(Mandatory = $false)] [string]$TempPrefix = 'temp'
 )
 
-$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.14'
-$VerbosePreference = 'Continue'
+$ScriptVersion = '3.0'
+$StorageApiVersion = '2023-11-03'
+$NowUtc = (Get-Date).ToUniversalTime()
+$TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
 
 function Write-RunbookLog {
   param(
-    [Parameter(Mandatory = $true)] [string]$Message,
-    [ValidateSet('INFO', 'WARN', 'ERROR', 'DEBUG')] [string]$Level = 'INFO'
+    [Parameter(Mandatory = $false)] [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')] [string]$Level = 'INFO',
+    [Parameter(Mandatory = $true)] [string]$Message
   )
 
-  $ts = (Get-Date).ToUniversalTime().ToString('o')
+  $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
   Write-Output "[$ts][$Level] $Message"
 }
 
 function Write-ExceptionDetails {
   param(
-    [Parameter(Mandatory = $true)] [System.Management.Automation.ErrorRecord]$ErrorRecord
+    [Parameter(Mandatory = $true)] $Exception,
+    [Parameter(Mandatory = $false)] [string]$Context = ''
   )
 
-  Write-Output "[EXCEPTION] Type      : $($ErrorRecord.Exception.GetType().FullName)"
-  Write-Output "[EXCEPTION] Message   : $($ErrorRecord.Exception.Message)"
-  if ($ErrorRecord.InvocationInfo) {
-    Write-Output "[EXCEPTION] Command   : $($ErrorRecord.InvocationInfo.MyCommand)"
-    Write-Output "[EXCEPTION] Script    : $($ErrorRecord.InvocationInfo.ScriptName)"
-    Write-Output "[EXCEPTION] Line      : $($ErrorRecord.InvocationInfo.ScriptLineNumber)"
-    Write-Output "[EXCEPTION] Position  : $($ErrorRecord.InvocationInfo.OffsetInLine)"
-    Write-Output "[EXCEPTION] LineText  : $($ErrorRecord.InvocationInfo.Line)"
-  }
-  if ($ErrorRecord.ScriptStackTrace) {
-    Write-Output "[EXCEPTION] Stack     : $($ErrorRecord.ScriptStackTrace)"
-  }
-}
-
-function ConvertTo-TokenString {
-  param(
-    [Parameter(Mandatory = $true)] $TokenValue
-  )
-
-  if ($TokenValue -is [securestring]) {
-    return [System.Net.NetworkCredential]::new('', $TokenValue).Password
+  if (-not [string]::IsNullOrWhiteSpace($Context)) {
+    Write-RunbookLog -Level 'ERROR' -Message $Context
   }
 
-  return [string]$TokenValue
-}
+  Write-Output "[EXCEPTION] Type      : $($Exception.GetType().FullName)"
+  Write-Output "[EXCEPTION] Message   : $($Exception.Message)"
 
-function Is-ExpiredTokenError {
-  param(
-    [Parameter(Mandatory = $true)] $ErrorRecord
-  )
-
-  $text = [string]$ErrorRecord
-  if ($text -match 'ExpiredAuthenticationToken|Authentication token has expired|access token expiry') {
-    return $true
+  if ($Exception.PSObject.Properties.Name -contains 'InvocationInfo' -and $Exception.InvocationInfo) {
+    Write-Output "[EXCEPTION] Command   : $($Exception.InvocationInfo.MyCommand)"
+    Write-Output "[EXCEPTION] Line      : $($Exception.InvocationInfo.ScriptLineNumber)"
+    Write-Output "[EXCEPTION] Position  : $($Exception.InvocationInfo.OffsetInLine)"
+    Write-Output "[EXCEPTION] LineText  : $($Exception.InvocationInfo.Line)"
   }
-
-  if ($ErrorRecord.Exception -and $ErrorRecord.Exception.Message -match 'ExpiredAuthenticationToken|Authentication token has expired|access token expiry') {
-    return $true
-  }
-
-  return $false
-}
-
-function Is-ThrottlingError {
-  param(
-    [Parameter(Mandatory = $true)] $ErrorRecord
-  )
-
-  try {
-    $statusCode = [int]$ErrorRecord.Exception.Response.StatusCode
-    return $statusCode -eq 429
-  } catch {
-    return $false
-  }
-}
-
-function Get-RetryAfterSeconds {
-  param(
-    [Parameter(Mandatory = $true)] $ErrorRecord,
-    [int]$DefaultSeconds = 5
-  )
-
-  try {
-    $retryAfter = $ErrorRecord.Exception.Response.Headers['Retry-After']
-    if ($retryAfter -and [int]::TryParse([string]$retryAfter, [ref]0)) {
-      return [int]$retryAfter
-    }
-  } catch {}
-
-  return $DefaultSeconds
-}
-
-trap {
-  Write-RunbookLog -Level 'ERROR' -Message 'Unhandled terminating error in runbook.'
-  Write-ExceptionDetails -ErrorRecord $_
-  throw
-}
-
-#region ── Helpers ─────────────────────────────────────────────────────────────
-
-function Get-ManagedIdentityToken {
-  <#
-  .SYNOPSIS Acquires an OAuth2 access token for the given resource using the
-            Automation Account managed identity via Get-AzAccessToken.
-  #>
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$ResourceUrl
-  )
-
-  try {
-    # Avoid -AsSecureString for compatibility with older Az.Accounts versions in Automation.
-    [void](Write-RunbookLog -Level 'DEBUG' -Message "Acquiring token for resource: $ResourceUrl")
-    $tokenObj = Get-AzAccessToken -ResourceUrl $ResourceUrl
-  } catch {
-    [void](Write-RunbookLog -Level 'ERROR' -Message "Get-AzAccessToken failed for resource: $ResourceUrl")
-    [void](Write-ExceptionDetails -ErrorRecord $_)
-    throw
-  }
-
-  # Log the token type so we can diagnose future version changes in Az.Accounts.
-  $rawToken = $tokenObj.Token
-  [void](Write-RunbookLog -Level 'DEBUG' -Message "Token type returned by Get-AzAccessToken: $($rawToken.GetType().FullName)")
-
-  # Convert to plain string regardless of whether Az.Accounts returns SecureString or String.
-  $token = ConvertTo-TokenString -TokenValue $rawToken
-
-  if ([string]::IsNullOrWhiteSpace($token)) {
-    throw "Failed to acquire access token for resource '$ResourceUrl'."
-  }
-
-  [void](Write-RunbookLog -Level 'DEBUG' -Message "Token acquired for resource: $ResourceUrl")
-  return $token
-}
-
-function Invoke-GraphPagedGet {
-  <#
-  .SYNOPSIS Pages through a Graph collection endpoint and returns all items as
-            a flat array, following @odata.nextLink automatically.
-            Implements exponential backoff retry for 429 throttling errors.
-  #>
-  param(
-    [Parameter(Mandatory = $true)] [string]$Path,
-    [Parameter(Mandatory = $true)] $Token,
-    [int]$MaxRetries = 5
-  )
-
-  $tokenString = ConvertTo-TokenString -TokenValue $Token
-
-  $getCaseInsensitiveMember = {
-    param($Object, [string]$Name)
-
-    if ($null -eq $Object) { return $null }
-
-    if ($Object -is [System.Collections.IDictionary]) {
-      foreach ($key in $Object.Keys) {
-        if ([string]$key -ieq $Name) {
-          return $Object[$key]
-        }
-      }
-      return $null
-    }
-
-    $prop = $Object.PSObject.Properties[$Name]
-    if ($prop) {
-      return $prop.Value
-    }
-
-    foreach ($p in $Object.PSObject.Properties) {
-      if ([string]$p.Name -ieq $Name) {
-        return $p.Value
-      }
-    }
-
-    return $null
-  }
-
-  $url   = "$GraphBaseUrl$Path"
-  $items = [System.Collections.Generic.List[object]]::new()
-  $pageCount = 0
-
-  while ($url) {
-    $retryCount = 0
-    $requestCompleted = $false
-
-    while (-not $requestCompleted -and $retryCount -lt $MaxRetries) {
-      try {
-        $response = Invoke-RestMethod -Method GET -Uri $url `
-          -Headers @{ Authorization = "Bearer $tokenString"; ConsistencyLevel = 'eventual' }
-        $requestCompleted = $true
-      } catch {
-        if (Is-ExpiredTokenError -ErrorRecord $_) {
-          Write-RunbookLog -Level 'WARN' -Message 'Graph token expired during paging; refreshing and retrying current page.'
-          $tokenString = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com'
-          # Retry immediately without incrementing retry count for token expiry
-          continue
-        } elseif (Is-ThrottlingError -ErrorRecord $_) {
-          $retryCount++
-          if ($retryCount -ge $MaxRetries) {
-            Write-RunbookLog -Level 'ERROR' -Message "Graph request throttled (429). Max retries ($MaxRetries) exceeded."
-            throw
-          }
-          $waitSeconds = Get-RetryAfterSeconds -ErrorRecord $_ -DefaultSeconds ([Math]::Pow(2, $retryCount - 1))
-          Write-RunbookLog -Level 'WARN' -Message "Graph request throttled (429). Retry $retryCount/$MaxRetries after $waitSeconds seconds."
-          Start-Sleep -Seconds $waitSeconds
-          # Retry the request
-          continue
-        } else {
-          throw
-        }
-      }
-    }
-
-    if (-not $requestCompleted) {
-      throw "Graph request failed after $MaxRetries retries."
-    }
-
-    $pageCount++
-
-    $value = & $getCaseInsensitiveMember $response 'value'
-
-    # Some runtimes may wrap Graph responses and expose another nested `value`
-    # object. Unwrap recursively until we reach a real array payload.
-    $unwrapDepth = 0
-    while ($null -ne $value -and $unwrapDepth -lt 5) {
-      $unwrapDepth++
-
-      if ($value -is [System.Collections.IDictionary]) {
-        $nested = & $getCaseInsensitiveMember $value 'value'
-        if ($null -ne $nested) {
-          $value = $nested
-          continue
-        }
-      }
-
-      if (
-        -not ($value -is [string]) -and
-        -not ($value -is [System.Collections.IDictionary]) -and
-        $value -isnot [System.Array] -and
-        $value -is [System.Collections.IEnumerable]
-      ) {
-        # IEnumerable that is not a dictionary/array is likely already a collection.
-        break
-      }
-
-      if (
-        -not ($value -is [string]) -and
-        -not ($value -is [System.Collections.IEnumerable])
-      ) {
-        $nested = & $getCaseInsensitiveMember $value 'value'
-        if ($null -ne $nested) {
-          $value = $nested
-          continue
-        }
-      }
-
-      break
-    }
-
-    if ($null -ne $value) {
-      if ($value -is [System.Collections.IDictionary]) {
-        # Treat dictionary-with-id as a single policy object; otherwise do not
-        # enumerate dictionary entries (which would become Key/Value metadata rows).
-        $hasId = $null -ne (& $getCaseInsensitiveMember $value 'id')
-        if ($hasId) {
-          $items.Add($value)
-        } else {
-          Write-RunbookLog -Level 'WARN' -Message "Graph collection '$Path' returned dictionary payload without id; skipping dictionary entry enumeration to avoid metadata pollution."
-        }
-      }
-      elseif ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
-        foreach ($item in $value) { $items.Add($item) }
-      }
-      else {
-        # Defensive fallback: Graph collection payload should always be an array.
-        # If it is not, still add the single object so the run doesn't silently drop it.
-        $items.Add($value)
-      }
-    } elseif (
-      $response -is [System.Collections.IEnumerable] -and
-      -not ($response -is [string]) -and
-      -not ($response -is [System.Collections.IDictionary])
-    ) {
-      foreach ($item in $response) { $items.Add($item) }
-    }
-
-    $nextLink = $null
-    if ($response -is [System.Collections.IDictionary]) {
-      foreach ($key in $response.Keys) {
-        if ([string]$key -ieq '@odata.nextLink' -or [string]$key -ieq 'odata.nextLink') {
-          $nextLink = [string]$response[$key]
-          break
-        }
-      }
-    } else {
-      $nextLinkProp = $response.PSObject.Properties['@odata.nextLink']
-      if (-not $nextLinkProp) {
-        $nextLinkProp = $response.PSObject.Properties['odata.nextLink']
-      }
-      if (-not $nextLinkProp) {
-        $nextLinkProp = $response.PSObject.Properties['@odata.nextlink']
-      }
-      if ($nextLinkProp) {
-        $nextLink = [string]$nextLinkProp.Value
-      }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($nextLink)) {
-      $url = $nextLink
-    } else {
-      $url = $null
-    }
-  }
-
-  Write-RunbookLog -Level 'DEBUG' -Message "Graph collection '$Path' pages: $pageCount, items: $($items.Count)"
-
-  if ($items.Count -gt 0) {
-    $sample = $items[0]
-    $sampleId = ''
-    if ($sample -is [System.Collections.IDictionary]) {
-      foreach ($k in $sample.Keys) {
-        if ([string]$k -ieq 'id') {
-          $sampleId = [string]$sample[$k]
-          break
-        }
-      }
-    } else {
-      $idProp = $sample.PSObject.Properties['id']
-      if ($idProp) { $sampleId = [string]$idProp.Value }
-    }
-
-    Write-RunbookLog -Level 'DEBUG' -Message "Graph collection '$Path' sample item type: $($sample.GetType().FullName), hasId: $(-not [string]::IsNullOrWhiteSpace($sampleId))"
-  }
-
-  return , $items.ToArray()
 }
 
 function Get-HttpStatusCode {
-  param(
-    [Parameter(Mandatory = $true)] $ErrorRecord
-  )
+  param([Parameter(Mandatory = $true)] $ErrorRecord)
 
-  try {
-    return [int]$ErrorRecord.Exception.Response.StatusCode
-  } catch {
-    return $null
-  }
-}
+  if ($null -eq $ErrorRecord) { return $null }
 
-function Invoke-GraphGet {
-  <#
-  .SYNOPSIS Executes a single Graph GET request with token-refresh and
-            throttling retry behavior.
-  #>
-  param(
-    [Parameter(Mandatory = $true)] [string]$Path,
-    [Parameter(Mandatory = $true)] $Token,
-    [int]$MaxRetries = 5
-  )
+  $exception = $ErrorRecord.Exception
+  if ($null -eq $exception) { return $null }
 
-  $tokenString = ConvertTo-TokenString -TokenValue $Token
-  $url = "$GraphBaseUrl$Path"
-  $retryCount = 0
-
-  while ($retryCount -lt $MaxRetries) {
+  if ($exception.PSObject.Properties.Name -contains 'Response' -and $exception.Response) {
     try {
-      return Invoke-RestMethod -Method GET -Uri $url -Headers @{
-        Authorization   = "Bearer $tokenString"
-        ConsistencyLevel = 'eventual'
-      }
+      return [int]$exception.Response.StatusCode
     } catch {
-      if (Is-ExpiredTokenError -ErrorRecord $_) {
-        Write-RunbookLog -Level 'WARN' -Message "Graph token expired for '$Path'; refreshing and retrying."
-        $tokenString = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com'
-        continue
-      }
-
-      if (Is-ThrottlingError -ErrorRecord $_) {
-        $retryCount++
-        if ($retryCount -ge $MaxRetries) {
-          Write-RunbookLog -Level 'ERROR' -Message "Graph GET throttled for '$Path'. Max retries ($MaxRetries) exceeded."
-          throw
-        }
-
-        $waitSeconds = Get-RetryAfterSeconds -ErrorRecord $_ -DefaultSeconds ([Math]::Pow(2, $retryCount - 1))
-        Write-RunbookLog -Level 'WARN' -Message "Graph GET throttled for '$Path'. Retry $retryCount/$MaxRetries after $waitSeconds seconds."
-        Start-Sleep -Seconds $waitSeconds
-        continue
-      }
-
-      throw
+      return $null
     }
   }
 
-  throw "Graph GET failed after $MaxRetries retries for '$Path'."
-}
-
-function Get-CaseInsensitiveValue {
-  param(
-    [Parameter(Mandatory = $true)] $Object,
-    [Parameter(Mandatory = $true)] [string]$Name
-  )
-
-  if ($null -eq $Object) { return $null }
-
-  if ($Object -is [System.Collections.IDictionary]) {
-    foreach ($key in $Object.Keys) {
-      if ([string]$key -ieq $Name) {
-        return $Object[$key]
-      }
-    }
-    return $null
-  }
-
-  $prop = $Object.PSObject.Properties[$Name]
-  if ($prop) {
-    return $prop.Value
-  }
-
-  foreach ($p in $Object.PSObject.Properties) {
-    if ([string]$p.Name -ieq $Name) {
-      return $p.Value
+  if ($exception.PSObject.Properties.Name -contains 'StatusCode') {
+    try {
+      return [int]$exception.StatusCode
+    } catch {
+      return $null
     }
   }
 
   return $null
 }
 
-function Get-IntunePolicyId {
+function Get-ManagedIdentityToken {
   param(
-    [Parameter(Mandatory = $true)] $PolicyObject
+    [Parameter(Mandatory = $true)] [string]$ResourceUrl
   )
 
-  return [string](Get-CaseInsensitiveValue -Object $PolicyObject -Name 'id')
+  Write-RunbookLog -Level 'DEBUG' -Message "Attempting to acquire token for '$ResourceUrl'"
+
+  $token = $null
+
+  try {
+    $tokenResult = Get-AzAccessToken -ResourceUrl $ResourceUrl -TenantId $TenantId
+    if ($tokenResult -and $tokenResult.Token) {
+      $token = [string]$tokenResult.Token
+    }
+  } catch {
+    Write-RunbookLog -Level 'WARN' -Message "Get-AzAccessToken with -TenantId failed for '$ResourceUrl'. Retrying without tenant."
+    try {
+      $tokenResult = Get-AzAccessToken -ResourceUrl $ResourceUrl
+      if ($tokenResult -and $tokenResult.Token) {
+        $token = [string]$tokenResult.Token
+      }
+    } catch {
+      Write-ExceptionDetails -Exception $_.Exception -Context "Unable to acquire token for '$ResourceUrl'."
+      throw
+    }
+  }
+
+  if ([string]::IsNullOrWhiteSpace($token)) {
+    throw "Managed identity token was empty for resource '$ResourceUrl'."
+  }
+
+  return $token
 }
 
-function Try-Invoke-GraphPagedGet {
+function Invoke-GraphRequest {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Url,
+    [Parameter(Mandatory = $true)] [string]$Token
+  )
+
+  $headers = @{ Authorization = "Bearer $Token" }
+  $attempt = 0
+
+  while ($true) {
+    $attempt++
+    try {
+      return Invoke-RestMethod -Method Get -Uri $Url -Headers $headers -ErrorAction Stop
+    } catch {
+      $statusCode = Get-HttpStatusCode -ErrorRecord $_
+      $isRetryable = $statusCode -in @(429, 500, 502, 503, 504)
+      if (-not $isRetryable -or $attempt -ge 8) {
+        throw
+      }
+
+      $retryAfter = 0
+      if ($_.Exception -and $_.Exception.Response -and $_.Exception.Response.Headers) {
+        $retryAfterHeader = $_.Exception.Response.Headers['Retry-After']
+        if ($retryAfterHeader) {
+          [void][int]::TryParse([string]$retryAfterHeader, [ref]$retryAfter)
+        }
+      }
+
+      if ($retryAfter -le 0) {
+        $retryAfter = [math]::Min([int][math]::Pow(2, $attempt), 30)
+      }
+
+      Write-RunbookLog -Level 'WARN' -Message "Graph request throttled/failed (HTTP $statusCode). Retrying in $retryAfter second(s)."
+      Start-Sleep -Seconds $retryAfter
+    }
+  }
+}
+
+function Invoke-GraphPagedGet {
   param(
     [Parameter(Mandatory = $true)] [string]$Path,
-    [Parameter(Mandatory = $true)] $Token
+    [Parameter(Mandatory = $true)] [string]$Token
   )
 
-  try {
-    return Invoke-GraphPagedGet -Path $Path -Token $Token
-  } catch {
-    $statusCode = Get-HttpStatusCode -ErrorRecord $_
-    if ($statusCode -eq 404) {
-      return @()
-    }
-
-    throw
-  }
-}
-
-function Get-IntunePolicyContent {
-  <#
-  .SYNOPSIS Resolves one Intune policy into a content-rich FLAT hashtable.
-            Settings, assignments, and extra collections are injected as
-            '_settings', '_assignments', etc. keys directly on the detail
-            object so that Build-PolicyMap sees 'id'/'displayName' at
-            the top level exactly as before.
-  Valid PolicyType values: configuration, device, security, compliance,
-    groupPolicy, updateRing, featureUpdate, qualityUpdate, driverUpdate,
-    script, healthScript, shellScript, enrollment, autopilot,
-    appProtection, conditionalAccess
-  #>
-  param(
-    [Parameter(Mandatory = $true)] [string]$PolicyType,
-    [Parameter(Mandatory = $true)] $PolicyObject,
-    [Parameter(Mandatory = $true)] $Token
-  )
-
-  $policyId = Get-IntunePolicyId -PolicyObject $PolicyObject
-
-  # Initialise all path variables so Set-StrictMode never fires on undefined vars.
-  $detailPath      = ''
-  $settingsPath    = ''
-  $assignmentsPath = ''
-  $extraPaths      = @{}
-
-  switch ($PolicyType) {
-    'configuration' {
-      $detailPath      = "/beta/deviceManagement/configurationPolicies/$policyId"
-      $settingsPath    = "/beta/deviceManagement/configurationPolicies/$policyId/settings?`$top=1000"
-      $assignmentsPath = "/beta/deviceManagement/configurationPolicies/$policyId/assignments?`$top=1000"
-    }
-    'device' {
-      $detailPath      = "/beta/deviceManagement/deviceConfigurations/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/deviceConfigurations/$policyId/assignments?`$top=1000"
-    }
-    'security' {
-      $detailPath      = "/beta/deviceManagement/intents/$policyId"
-      $settingsPath    = "/beta/deviceManagement/intents/$policyId/settings?`$top=1000"
-      $assignmentsPath = "/beta/deviceManagement/intents/$policyId/assignments?`$top=1000"
-    }
-    'compliance' {
-      $detailPath      = "/beta/deviceManagement/deviceCompliancePolicies/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/deviceCompliancePolicies/$policyId/assignments?`$top=1000"
-      $extraPaths['_scheduledActionsForRule'] = "/beta/deviceManagement/deviceCompliancePolicies/$policyId/scheduledActionsForRule?`$top=1000"
-    }
-    'groupPolicy' {
-      $detailPath      = "/beta/deviceManagement/groupPolicyConfigurations/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/groupPolicyConfigurations/$policyId/assignments?`$top=1000"
-      $extraPaths['_definitionValues'] = "/beta/deviceManagement/groupPolicyConfigurations/$policyId/definitionValues?`$top=1000"
-    }
-    'updateRing' {
-      $detailPath      = "/beta/deviceManagement/windowsUpdateForBusinessConfigurations/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/windowsUpdateForBusinessConfigurations/$policyId/assignments?`$top=1000"
-    }
-    'featureUpdate' {
-      $detailPath      = "/beta/deviceManagement/windowsFeatureUpdateProfiles/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/windowsFeatureUpdateProfiles/$policyId/assignments?`$top=1000"
-    }
-    'qualityUpdate' {
-      $detailPath      = "/beta/deviceManagement/windowsQualityUpdateProfiles/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/windowsQualityUpdateProfiles/$policyId/assignments?`$top=1000"
-    }
-    'driverUpdate' {
-      $detailPath      = "/beta/deviceManagement/windowsDriverUpdateProfiles/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/windowsDriverUpdateProfiles/$policyId/assignments?`$top=1000"
-    }
-    'script' {
-      $detailPath      = "/beta/deviceManagement/deviceManagementScripts/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/deviceManagementScripts/$policyId/assignments?`$top=1000"
-    }
-    'healthScript' {
-      $detailPath      = "/beta/deviceManagement/deviceHealthScripts/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/deviceHealthScripts/$policyId/assignments?`$top=1000"
-    }
-    'shellScript' {
-      $detailPath      = "/beta/deviceManagement/deviceShellScripts/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/deviceShellScripts/$policyId/assignments?`$top=1000"
-    }
-    'enrollment' {
-      $detailPath      = "/beta/deviceManagement/deviceEnrollmentConfigurations/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/deviceEnrollmentConfigurations/$policyId/assignments?`$top=1000"
-    }
-    'autopilot' {
-      $detailPath      = "/beta/deviceManagement/windowsAutopilotDeploymentProfiles/$policyId"
-      $assignmentsPath = "/beta/deviceManagement/windowsAutopilotDeploymentProfiles/$policyId/assignments?`$top=1000"
-    }
-    'appProtection' {
-      # App protection policies have type-specific endpoints; use list object as detail.
-      $detailPath = ''
-    }
-    'conditionalAccess' {
-      $detailPath = "/v1.0/identity/conditionalAccess/policies/$policyId"
-    }
-  }
-
-  # Fetch the detail object and convert to hashtable so 'id'/'displayName' are at
-  # the top level and Build-PolicyMap can read them without any special casing.
-  $contentHt = @{}
-  if (-not [string]::IsNullOrWhiteSpace($detailPath)) {
-    try {
-      $detailObj = Invoke-GraphGet -Path $detailPath -Token $Token
-      $contentHt = $detailObj | ConvertTo-Json -Depth 50 -Compress | ConvertFrom-Json -AsHashtable
-    } catch {
-      Write-RunbookLog -Level 'WARN' -Message "Failed to get detail for $PolicyType/$policyId; using list metadata."
-      try { $contentHt = $PolicyObject | ConvertTo-Json -Depth 50 -Compress | ConvertFrom-Json -AsHashtable } catch {}
-    }
+  $items = [System.Collections.Generic.List[object]]::new()
+  if ($Path.StartsWith('http')) {
+    $next = $Path
   } else {
-    try { $contentHt = $PolicyObject | ConvertTo-Json -Depth 50 -Compress | ConvertFrom-Json -AsHashtable } catch {}
+    $next = "$GraphBaseUrl$Path"
   }
 
-  # Guarantee 'id' is present even if the detail endpoint omitted it.
-  if (-not $contentHt.ContainsKey('id') -or [string]::IsNullOrWhiteSpace([string]$contentHt['id'])) {
-    if (-not [string]::IsNullOrWhiteSpace($policyId)) {
-      $contentHt['id'] = $policyId
-    }
-  }
+  while (-not [string]::IsNullOrWhiteSpace($next)) {
+    $response = Invoke-GraphRequest -Url $next -Token $Token
 
-  # Fetch settings (separate sub-resource endpoint).
-  if (-not [string]::IsNullOrWhiteSpace($settingsPath)) {
-    try {
-      $settingsItems = Try-Invoke-GraphPagedGet -Path $settingsPath -Token $Token
-      if (@($settingsItems).Count -gt 0) { $contentHt['_settings'] = $settingsItems }
-    } catch {
-      Write-RunbookLog -Level 'WARN' -Message "Failed to get settings for $PolicyType/$policyId."
-    }
-  }
-
-  # Fetch assignments.
-  if (-not [string]::IsNullOrWhiteSpace($assignmentsPath)) {
-    try {
-      $assignmentItems = Try-Invoke-GraphPagedGet -Path $assignmentsPath -Token $Token
-      if (@($assignmentItems).Count -gt 0) { $contentHt['_assignments'] = $assignmentItems }
-    } catch {
-      Write-RunbookLog -Level 'WARN' -Message "Failed to get assignments for $PolicyType/$policyId."
-    }
-  }
-
-  # Fetch any extra collections (scheduledActionsForRule, definitionValues, etc.).
-  foreach ($extraKey in $extraPaths.Keys) {
-    $extraPath = $extraPaths[$extraKey]
-    try {
-      $extraItems = Try-Invoke-GraphPagedGet -Path $extraPath -Token $Token
-      if (@($extraItems).Count -gt 0) { $contentHt[$extraKey] = $extraItems }
-    } catch {
-      Write-RunbookLog -Level 'WARN' -Message "Failed to get '$extraKey' for $PolicyType/$policyId."
-    }
-  }
-
-  return $contentHt
-}
-
-function Resolve-IntunePolicyContentCollection {
-  <#
-  .SYNOPSIS Enriches each policy item with full content payload for drift hashing.
-  #>
-  param(
-    [Parameter(Mandatory = $true)] [string]$PolicyType,
-    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [array]$Items,
-    [Parameter(Mandatory = $true)] $Token
-  )
-
-  $resolved = [System.Collections.Generic.List[object]]::new()
-  $total = $Items.Count
-  $index = 0
-
-  foreach ($item in $Items) {
-    $index++
-    if (($index % 25) -eq 0 -or $index -eq $total) {
-      Write-RunbookLog -Level 'DEBUG' -Message "Resolving $PolicyType policy content: $index/$total"
-    }
-
-    $resolved.Add((Get-IntunePolicyContent -PolicyType $PolicyType -PolicyObject $item -Token $Token))
-  }
-
-  return , $resolved.ToArray()
-}
-
-function Get-PolicyTypeCounts {
-  <#
-  .SYNOPSIS Returns a hashtable with policy counts by policyType from a policy map.
-  #>
-  param(
-    [Parameter(Mandatory = $true)] [hashtable]$PolicyMap
-  )
-
-  $counts = @{
-    configuration   = 0
-    device          = 0
-    security        = 0
-    compliance      = 0
-    groupPolicy     = 0
-    updateRing      = 0
-    featureUpdate   = 0
-    qualityUpdate   = 0
-    driverUpdate    = 0
-    script          = 0
-    healthScript    = 0
-    shellScript     = 0
-    enrollment      = 0
-    autopilot       = 0
-    appProtection   = 0
-    conditionalAccess = 0
-  }
-
-  foreach ($entry in $PolicyMap.Values) {
-    $type = [string]$entry.policyType
-    if ($counts.ContainsKey($type)) {
-      $counts[$type] = [int]$counts[$type] + 1
-    }
-  }
-
-  return $counts
-}
-
-function ConvertTo-NormalizedObject {
-  <#
-  .SYNOPSIS Recursively sorts object properties and strips OData metadata keys
-            so that two semantically identical objects always serialise to the
-            same JSON string regardless of property ordering.
-  #>
-  param(
-    [Parameter(ValueFromPipeline = $true)]
-    $InputObject,
-
-    [int]$CurrentDepth = 0,
-    [int]$MaxDepth = 40,
-    [hashtable]$Visited = $null
-  )
-
-  if ($CurrentDepth -ge $MaxDepth) {
-    return '[MaxDepthReached]'
-  }
-
-  if ($null -eq $Visited) {
-    $Visited = @{}
-  }
-
-  # Scalar pass-through
-  if ($null -eq $InputObject)                      { return $null }
-  if ($InputObject -is [bool])                     { return $InputObject }
-  if ($InputObject -is [string])                   { return $InputObject }
-  if ($InputObject -is [datetime] -or $InputObject -is [guid]) { return $InputObject }
-  if ($InputObject -is [int]   -or
-      $InputObject -is [long]  -or
-      $InputObject -is [double]-or
-      $InputObject -is [decimal]) { return $InputObject }
-
-  $objectId = $null
-  $trackObject = $false
-
-  if (-not ($InputObject -is [ValueType])) {
-    $trackObject = $true
-    $objectId = [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($InputObject)
-    if ($Visited.ContainsKey($objectId)) {
-      return '[CircularReference]'
-    }
-    $Visited[$objectId] = $true
-  }
-
-  try {
-    # Array / list
-    if ($InputObject -is [System.Collections.IEnumerable] -and
-      -not ($InputObject -is [System.Collections.IDictionary]) -and
-        -not ($InputObject -is [string])) {
-      $arr = [System.Collections.Generic.List[object]]::new()
-      foreach ($item in $InputObject) {
-        $arr.Add((ConvertTo-NormalizedObject -InputObject $item -CurrentDepth ($CurrentDepth + 1) -MaxDepth $MaxDepth -Visited $Visited))
+    if ($response.PSObject.Properties.Name -contains 'value' -and $response.value) {
+      foreach ($item in $response.value) {
+        [void]$items.Add($item)
       }
-      return , $arr.ToArray()
     }
 
-    # Object / hashtable — sort keys and strip OData noise
-    $oDataKeys = '@odata.context', '@odata.nextLink', '@odata.etag',
-                 '@odata.type', '@odata.id', '@odata.count'
+    $next = $null
+    if ($response.PSObject.Properties.Name -contains '@odata.nextLink' -and $response.'@odata.nextLink') {
+      $next = [string]$response.'@odata.nextLink'
+    }
+  }
 
-    $sourceKeys = if ($InputObject -is [System.Collections.IDictionary]) {
-      $InputObject.Keys
+  return @($items)
+}
+
+function Invoke-GraphGet {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Path,
+    [Parameter(Mandatory = $true)] [string]$Token
+  )
+
+  $url = if ($Path.StartsWith('http')) { $Path } else { "$GraphBaseUrl$Path" }
+  return Invoke-GraphRequest -Url $url -Token $Token
+}
+
+function Get-ObjectId {
+  param([Parameter(Mandatory = $true)] $Object)
+
+  if ($null -eq $Object) { return '' }
+
+  $id = $null
+  if ($Object -is [System.Collections.IDictionary]) {
+    if ($Object.Contains('id')) { $id = $Object['id'] }
+  } else {
+    $prop = $Object.PSObject.Properties['id']
+    if ($prop) { $id = $prop.Value }
+  }
+
+  if ($null -eq $id) { return '' }
+  return [string]$id
+}
+
+function Get-ObjectName {
+  param([Parameter(Mandatory = $true)] $Object)
+
+  if ($null -eq $Object) { return '' }
+
+  $candidateProps = @('displayName', 'name', 'title')
+  foreach ($propName in $candidateProps) {
+    if ($Object -is [System.Collections.IDictionary]) {
+      if ($Object.Contains($propName) -and -not [string]::IsNullOrWhiteSpace([string]$Object[$propName])) {
+        return [string]$Object[$propName]
+      }
     } else {
-      $InputObject.PSObject.Properties.Name
-    }
-
-    $sorted = [ordered]@{}
-    foreach ($key in ($sourceKeys | Where-Object { $_ -notin $oDataKeys } | Sort-Object)) {
-      $val = if ($InputObject -is [System.Collections.IDictionary]) { $InputObject[$key] } else { $InputObject.$key }
-      $sorted[$key] = ConvertTo-NormalizedObject -InputObject $val -CurrentDepth ($CurrentDepth + 1) -MaxDepth $MaxDepth -Visited $Visited
-    }
-    return $sorted
-  } finally {
-    if ($trackObject -and $null -ne $objectId) {
-      [void]$Visited.Remove($objectId)
+      $prop = $Object.PSObject.Properties[$propName]
+      if ($prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+        return [string]$prop.Value
+      }
     }
   }
+
+  return ''
 }
 
-function Get-TextHash {
-  <#
-  .SYNOPSIS Returns a lowercase hex SHA-256 digest of the supplied UTF-8 string.
-  #>
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$Text
-  )
+function ConvertTo-Hashtable {
+  param([Parameter(Mandatory = $true)] $InputObject)
 
-  $sha = [System.Security.Cryptography.SHA256]::Create()
-  try {
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
-    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
-  } finally {
-    $sha.Dispose()
-  }
-}
-
-function Build-PolicyMap {
-  <#
-  .SYNOPSIS Converts a raw Graph collection into a keyed hashtable suitable for
-            hash-based diff comparison.  Key format: "<policyType>:<id>".
-  #>
-  param(
-    [Parameter(Mandatory = $true)] [string]$PolicyType,
-    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [array]$Items
-  )
-
-  $getDictValue = {
-    param([System.Collections.IDictionary]$Dict, [string]$Key)
-    foreach ($k in $Dict.Keys) {
-      if ([string]$k -ieq $Key) {
-        return $Dict[$k]
-      }
-    }
-    return $null
+  if ($null -eq $InputObject) {
+    return @{}
   }
 
-  $getPolicyId = {
-    param($PolicyItem)
-
-    $candidate = [string](Get-CaseInsensitiveValue -Object $PolicyItem -Name 'id')
-    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-      return $candidate
-    }
-
-    $candidate = [string](Get-CaseInsensitiveValue -Object $PolicyItem -Name 'policyId')
-    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-      return $candidate
-    }
-
-    $detail = Get-CaseInsensitiveValue -Object $PolicyItem -Name 'detail'
-    if ($null -ne $detail) {
-      $candidate = [string](Get-CaseInsensitiveValue -Object $detail -Name 'id')
-      if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-        return $candidate
-      }
-    }
-
-    return ''
-  }
-
-  $getPolicyName = {
-    param($PolicyItem, [string]$FallbackId)
-
-    $candidateName = [string](Get-CaseInsensitiveValue -Object $PolicyItem -Name 'name')
-    if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
-      return $candidateName
-    }
-
-    $candidateDisplayName = [string](Get-CaseInsensitiveValue -Object $PolicyItem -Name 'displayName')
-    if (-not [string]::IsNullOrWhiteSpace($candidateDisplayName)) {
-      return $candidateDisplayName
-    }
-
-    $detail = Get-CaseInsensitiveValue -Object $PolicyItem -Name 'detail'
-    if ($null -ne $detail) {
-      $detailName = [string](Get-CaseInsensitiveValue -Object $detail -Name 'name')
-      if (-not [string]::IsNullOrWhiteSpace($detailName)) {
-        return $detailName
-      }
-
-      $detailDisplayName = [string](Get-CaseInsensitiveValue -Object $detail -Name 'displayName')
-      if (-not [string]::IsNullOrWhiteSpace($detailDisplayName)) {
-        return $detailDisplayName
-      }
-    }
-
-    return $FallbackId
-  }
-
-  $map = @{}
-  $skippedNoId = 0
-  foreach ($item in $Items) {
-    $id = [string](& $getPolicyId $item)
-
-    if ([string]::IsNullOrWhiteSpace($id)) {
-      $skippedNoId++
-      continue
-    }
-
-    # Resolve display name — Graph uses 'name' or 'displayName' depending on endpoint
-    $name = [string](& $getPolicyName $item $id)
-
-    $normalized = ConvertTo-NormalizedObject $item
-    $json       = $normalized | ConvertTo-Json -Depth 100 -Compress
-
-    $map["$PolicyType`:$id"] = [pscustomobject]@{
-      policyType = $PolicyType
-      policyId   = $id
-      policyName = $name
-      hash       = Get-TextHash -Text $json
-      normalized = $normalized
-      json       = $json
-    }
-  }
-
-  if ($skippedNoId -gt 0) {
-    Write-RunbookLog -Level 'WARN' -Message "Build-PolicyMap skipped $skippedNoId '$PolicyType' item(s) because no id could be resolved."
-  }
-
-  return $map
-}
-
-function Merge-PolicyMaps {
-  <#
-  .SYNOPSIS Merges multiple policy-type hashtables into a single unified map.
-  #>
-  param(
-    [Parameter(Mandatory = $true)]
-    [hashtable[]]$Maps
-  )
-
-  $all = @{}
-  foreach ($m in $Maps) {
-    foreach ($k in $m.Keys) { $all[$k] = $m[$k] }
-  }
-  return $all
+  return ($InputObject | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json -AsHashtable)
 }
 
 function Try-Invoke-GraphCollection {
-  <#
-  .SYNOPSIS Executes a Graph collection read and returns empty array on 403/404,
-            allowing optional policy families to be included without failing the run.
-  #>
   param(
     [Parameter(Mandatory = $true)] [string]$Path,
-    [Parameter(Mandatory = $true)] $Token,
-    [Parameter(Mandatory = $true)] [string]$Label
+    [Parameter(Mandatory = $true)] [string]$Token,
+    [Parameter(Mandatory = $true)] [string]$Label,
+    [Parameter(Mandatory = $false)] [bool]$Optional = $true
   )
 
   try {
     return Invoke-GraphPagedGet -Path $Path -Token $Token
   } catch {
     $statusCode = Get-HttpStatusCode -ErrorRecord $_
-    if ($statusCode -eq 403 -or $statusCode -eq 404) {
+    if ($Optional -and $statusCode -in @(400, 403, 404)) {
       Write-RunbookLog -Level 'WARN' -Message "Skipping optional Graph collection '$Label' ($Path). HTTP $statusCode."
       return @()
     }
@@ -983,831 +257,653 @@ function Try-Invoke-GraphCollection {
   }
 }
 
-function Get-DriftEvents {
-  <#
-  .SYNOPSIS Compares two policy maps and returns an array of drift event objects
-            describing added, removed, and modified policies.
-  #>
+function Invoke-GraphDetailOptional {
   param(
-    [Parameter(Mandatory = $true)] [hashtable]$Baseline,
-    [Parameter(Mandatory = $true)] [hashtable]$Current,
-    [Parameter(Mandatory = $true)] [string]$Timestamp
+    [Parameter(Mandatory = $true)] [string]$Path,
+    [Parameter(Mandatory = $true)] [string]$Token,
+    [Parameter(Mandatory = $true)] [string]$Label
   )
-
-  $allKeys = [System.Collections.Generic.HashSet[string]]::new()
-  foreach ($k in $Baseline.Keys) { [void]$allKeys.Add($k) }
-  foreach ($k in $Current.Keys)  { [void]$allKeys.Add($k) }
-
-  $driftEvents = [System.Collections.Generic.List[pscustomobject]]::new()
-
-  foreach ($k in $allKeys) {
-    $prev = $Baseline[$k]
-    $cur  = $Current[$k]
-
-    # ── Added ────────────────────────────────────────────────────────────────
-    if ($null -eq $prev -and $null -ne $cur) {
-      $driftEvents.Add([pscustomobject]@{
-        policyKey    = $k
-        policyId     = $cur.policyId
-        policyType   = $cur.policyType
-        policyName   = $cur.policyName
-        modifiedAt   = $Timestamp
-        changeType   = 'added'
-        previousHash = ''
-        currentHash  = $cur.hash
-        changedFields = @()
-        driftItems   = @()
-      })
-      continue
-    }
-
-    # ── Removed ──────────────────────────────────────────────────────────────
-    if ($null -ne $prev -and $null -eq $cur) {
-      $driftEvents.Add([pscustomobject]@{
-        policyKey    = $k
-        policyId     = $prev.policyId
-        policyType   = $prev.policyType
-        policyName   = $prev.policyName
-        modifiedAt   = $Timestamp
-        changeType   = 'removed'
-        previousHash = $prev.hash
-        currentHash  = ''
-        changedFields = @()
-        driftItems   = @()
-      })
-      continue
-    }
-
-    # ── Unchanged ────────────────────────────────────────────────────────────
-    if ($prev.hash -eq $cur.hash) { continue }
-
-    # ── Modified — diff top-level fields ─────────────────────────────────────
-    # Round-trip through JSON to get comparable hashtables regardless of
-    # whether the source was a pscustomobject or already a hashtable (baseline
-    # read-back scenario).
-    $prevHt = $prev.normalized | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
-    $curHt  = $cur.normalized  | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable
-
-    $leafDrifts = @(Get-LeafDriftItems -Previous $prevHt -Current $curHt -MaxDepth 20 -MaxDiffs 40)
-    $changedFields = [System.Collections.Generic.List[string]]::new()
-    foreach ($entry in $leafDrifts) {
-      $changedFields.Add([string]$entry.field)
-    }
-
-    $driftEvents.Add([pscustomobject]@{
-      policyKey    = $k
-      policyId     = $cur.policyId
-      policyType   = $cur.policyType
-      policyName   = $cur.policyName
-      modifiedAt   = $Timestamp
-      changeType   = 'modified'
-      previousHash = $prev.hash
-      currentHash  = $cur.hash
-      changedFields = $changedFields.ToArray()
-      driftItems   = $leafDrifts
-    })
-  }
-
-  return , $driftEvents.ToArray()
-}
-
-function Add-LeafDiffs {
-  <#
-  .SYNOPSIS Recursively compares two normalized values and appends leaf-level
-            field differences into the provided list.
-  #>
-  param(
-    $Previous,
-    $Current,
-    [string]$Path,
-    [int]$Depth,
-    [int]$MaxDepth,
-    [int]$MaxDiffs,
-    [System.Collections.Generic.List[hashtable]]$Diffs
-  )
-
-  if ($Diffs.Count -ge $MaxDiffs) { return }
-
-  $toJson = {
-    param($Value)
-    if ($null -eq $Value) { return 'null' }
-    return $Value | ConvertTo-Json -Depth 20 -Compress
-  }
-
-  if ($Depth -ge $MaxDepth) {
-    $aJson = & $toJson $Previous
-    $bJson = & $toJson $Current
-    if ($aJson -ne $bJson) {
-      $Diffs.Add(@{
-        field = if ([string]::IsNullOrWhiteSpace($Path)) { '(root)' } else { $Path }
-        previousValue = $aJson
-        currentValue = $bJson
-      })
-    }
-    return
-  }
-
-  $prevIsObject = $null -ne $Previous -and ($Previous -is [System.Collections.IDictionary])
-  $curIsObject  = $null -ne $Current  -and ($Current  -is [System.Collections.IDictionary])
-
-  if ($prevIsObject -and $curIsObject) {
-    $keys = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($k in $Previous.Keys) { [void]$keys.Add([string]$k) }
-    foreach ($k in $Current.Keys)  { [void]$keys.Add([string]$k) }
-
-    foreach ($key in ($keys | Sort-Object)) {
-      if ($Diffs.Count -ge $MaxDiffs) { break }
-      $nextPath = if ([string]::IsNullOrWhiteSpace($Path)) { $key } else { "$Path.$key" }
-      Add-LeafDiffs -Previous $Previous[$key] -Current $Current[$key] -Path $nextPath -Depth ($Depth + 1) -MaxDepth $MaxDepth -MaxDiffs $MaxDiffs -Diffs $Diffs
-    }
-    return
-  }
-
-  $prevIsArray = $null -ne $Previous -and ($Previous -is [System.Collections.IEnumerable]) -and -not ($Previous -is [string]) -and -not ($Previous -is [System.Collections.IDictionary])
-  $curIsArray  = $null -ne $Current  -and ($Current  -is [System.Collections.IEnumerable]) -and -not ($Current  -is [string]) -and -not ($Current  -is [System.Collections.IDictionary])
-
-  if ($prevIsArray -and $curIsArray) {
-    $prevArr = @($Previous)
-    $curArr  = @($Current)
-    $maxLen = [Math]::Max($prevArr.Count, $curArr.Count)
-
-    for ($i = 0; $i -lt $maxLen; $i++) {
-      if ($Diffs.Count -ge $MaxDiffs) { break }
-      $a = if ($i -lt $prevArr.Count) { $prevArr[$i] } else { $null }
-      $b = if ($i -lt $curArr.Count)  { $curArr[$i] } else { $null }
-      $nextPath = if ([string]::IsNullOrWhiteSpace($Path)) { "[$i]" } else { "$Path[$i]" }
-      Add-LeafDiffs -Previous $a -Current $b -Path $nextPath -Depth ($Depth + 1) -MaxDepth $MaxDepth -MaxDiffs $MaxDiffs -Diffs $Diffs
-    }
-    return
-  }
-
-  $left = & $toJson $Previous
-  $right = & $toJson $Current
-  if ($left -ne $right) {
-    $Diffs.Add(@{
-      field = if ([string]::IsNullOrWhiteSpace($Path)) { '(root)' } else { $Path }
-      previousValue = $left
-      currentValue = $right
-    })
-  }
-}
-
-function Get-LeafDriftItems {
-  <#
-  .SYNOPSIS Returns leaf-level drift items with field paths for two normalized
-            hashtable values.
-  #>
-  param(
-    [hashtable]$Previous,
-    [hashtable]$Current,
-    [int]$MaxDepth = 20,
-    [int]$MaxDiffs = 40
-  )
-
-  $diffs = [System.Collections.Generic.List[hashtable]]::new()
-  Add-LeafDiffs -Previous $Previous -Current $Current -Path '' -Depth 0 -MaxDepth $MaxDepth -MaxDiffs $MaxDiffs -Diffs $diffs
-  return , $diffs.ToArray()
-}
-
-function Build-DriftDataJson {
-  <#
-  .SYNOPSIS Builds a size-safe JSON payload for table storage driftData.
-  #>
-  param(
-    $DriftItems,
-    [string]$FallbackPrevious,
-    [string]$FallbackCurrent,
-    [int]$MaxChars = 30000,
-    [int]$MaxItemValueChars = 1200,
-    [int]$MaxItems = 20
-  )
-
-  $truncate = {
-    param([string]$Value, [int]$Limit)
-    if ($null -eq $Value) { return '' }
-    if ($Value.Length -le $Limit) { return $Value }
-    return $Value.Substring(0, $Limit) + '...[truncated]'
-  }
-
-  $sourceItems = if ($null -ne $DriftItems -and @($DriftItems).Count -gt 0) {
-    @($DriftItems)
-  } else {
-    @(@{
-      field         = 'changeType'
-      previousValue = $FallbackPrevious
-      currentValue  = $FallbackCurrent
-    })
-  }
-
-  $safeItems = [System.Collections.Generic.List[hashtable]]::new()
-  foreach ($item in $sourceItems) {
-    if ($safeItems.Count -ge $MaxItems) { break }
-
-    $field = if ($item -is [hashtable]) { [string]$item['field'] } else { [string]$item.field }
-    $previousValue = if ($item -is [hashtable]) { [string]$item['previousValue'] } else { [string]$item.previousValue }
-    $currentValue = if ($item -is [hashtable]) { [string]$item['currentValue'] } else { [string]$item.currentValue }
-
-    if ([string]::IsNullOrWhiteSpace($field)) { $field = 'unknown' }
-
-    $safeItems.Add(@{
-      field         = (& $truncate $field 300)
-      previousValue = (& $truncate $previousValue $MaxItemValueChars)
-      currentValue  = (& $truncate $currentValue $MaxItemValueChars)
-    })
-  }
-
-  $json = $safeItems | ConvertTo-Json -Compress
-  while ($json.Length -gt $MaxChars -and $safeItems.Count -gt 1) {
-    $safeItems.RemoveAt($safeItems.Count - 1)
-    $json = $safeItems | ConvertTo-Json -Compress
-  }
-
-  if ($json.Length -gt $MaxChars -and $safeItems.Count -eq 1) {
-    $single = $safeItems[0]
-    $single['previousValue'] = (& $truncate ([string]$single['previousValue']) 400)
-    $single['currentValue'] = (& $truncate ([string]$single['currentValue']) 400)
-    $json = @($single) | ConvertTo-Json -Compress
-  }
-
-  return $json
-}
-
-function Write-StorageBlob {
-  <#
-  .SYNOPSIS Writes UTF-8 text as a BlockBlob via Azure Blob Storage REST API.
-  #>
-  param(
-    [Parameter(Mandatory = $true)] $Token,
-    [Parameter(Mandatory = $true)] [string]$BlobPath,
-    [Parameter(Mandatory = $true)] [string]$Text,
-    [string]$ContentType = 'application/json; charset=utf-8'
-  )
-
-  $tokenString = ConvertTo-TokenString -TokenValue $Token
-
-  $uri   = "https://$StorageAccountName.blob.core.windows.net/$ContainerName/$BlobPath"
-  $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
 
   try {
-    Invoke-RestMethod -Method PUT -Uri $uri -Headers @{
-      Authorization     = "Bearer $tokenString"
-      'x-ms-version'    = '2021-12-02'
-      'x-ms-blob-type'  = 'BlockBlob'
-      'Content-Type'    = $ContentType
-    } -Body $bytes | Out-Null
+    return Invoke-GraphGet -Path $Path -Token $Token
   } catch {
-    if (Is-ExpiredTokenError -ErrorRecord $_) {
-      Write-RunbookLog -Level 'WARN' -Message 'Storage token expired during blob write; refreshing and retrying.'
-      $tokenString = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com'
-      Invoke-RestMethod -Method PUT -Uri $uri -Headers @{
-        Authorization     = "Bearer $tokenString"
-        'x-ms-version'    = '2021-12-02'
-        'x-ms-blob-type'  = 'BlockBlob'
-        'Content-Type'    = $ContentType
-      } -Body $bytes | Out-Null
-    } else {
-      throw
-    }
-  }
-}
-
-function Write-TableEntity {
-  <#
-  .SYNOPSIS Inserts a new row into an Azure Table Storage table via REST API.
-  #>
-  param(
-    [Parameter(Mandatory = $true)] $Token,
-    [Parameter(Mandatory = $true)] [string]$TableName,
-    [Parameter(Mandatory = $true)] [hashtable]$Entity
-  )
-
-  $tokenString = ConvertTo-TokenString -TokenValue $Token
-
-  $uri = "https://$StorageAccountName.table.core.windows.net/$TableName"
-  $payload = $Entity | ConvertTo-Json -Depth 100 -Compress
-
-  try {
-    Invoke-RestMethod -Method POST -Uri $uri -Headers @{
-      Authorization        = "Bearer $tokenString"
-      'x-ms-version'       = '2019-02-02'
-      Accept               = 'application/json;odata=nometadata'
-      DataServiceVersion   = '3.0'
-      MaxDataServiceVersion = '3.0'
-      'Content-Type'       = 'application/json;odata=nometadata'
-      Prefer               = 'return-no-content'
-    } -Body $payload | Out-Null
-  } catch {
-    if (Is-ExpiredTokenError -ErrorRecord $_) {
-      Write-RunbookLog -Level 'WARN' -Message "Storage token expired during table write to '$TableName'; refreshing and retrying."
-      $tokenString = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com'
-      Invoke-RestMethod -Method POST -Uri $uri -Headers @{
-        Authorization        = "Bearer $tokenString"
-        'x-ms-version'       = '2019-02-02'
-        Accept               = 'application/json;odata=nometadata'
-        DataServiceVersion   = '3.0'
-        MaxDataServiceVersion = '3.0'
-        'Content-Type'       = 'application/json;odata=nometadata'
-        Prefer               = 'return-no-content'
-      } -Body $payload | Out-Null
-      return
+    $statusCode = Get-HttpStatusCode -ErrorRecord $_
+    if ($statusCode -in @(400, 403, 404)) {
+      Write-RunbookLog -Level 'WARN' -Message "Skipping optional detail '$Label' ($Path). HTTP $statusCode."
+      return $null
     }
 
-    $statusCode = 'unknown'
-    $responseBody = ''
-    if ($_.Exception.Response) {
-      try { $statusCode = [string][int]$_.Exception.Response.StatusCode } catch {}
-      try {
-        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-        $responseBody = $reader.ReadToEnd()
-        $reader.Dispose()
-      } catch {}
-    }
-
-    $preview = if ($payload.Length -gt 1200) { $payload.Substring(0, 1200) + '...[truncated]' } else { $payload }
-    throw "Table write failed for '$TableName' (HTTP $statusCode). Response: $responseBody PayloadPreview: $preview"
-  }
-}
-
-function New-AuditRow {
-  <#
-  .SYNOPSIS Builds a TenantAuditTrail entity hashtable for the heartbeat / summary row.
-  #>
-  param(
-    [string]$Note,
-    [string]$DriftSummary,
-    [string]$DriftData = '[]',
-    [string]$Timestamp
-  )
-  return @{
-    PartitionKey  = $TenantId
-    RowKey        = [guid]::NewGuid().ToString()
-    policyId      = 'tenant-drift-monitor'
-    policyType    = 'system'
-    policyName    = 'Tenant Drift Monitor'
-    modifiedBy    = 'automation-account'
-    modifiedAt    = $Timestamp
-    note          = $Note
-    driftSummary  = $DriftSummary
-    driftData     = $DriftData
-    source        = 'system'
-    timestamp     = $Timestamp
-  }
-}
-
-#endregion
-
-#region ── Main ────────────────────────────────────────────────────────────────
-
-Write-RunbookLog -Message "=== Detect-PolicyDrift $(Get-Date -Format 'u') version=$ScriptVersion ==="
-Write-RunbookLog -Message "Input parameters: TenantId='$TenantId' StorageAccountName='$StorageAccountName' ContainerName='$ContainerName' GraphBaseUrl='$GraphBaseUrl' BaselinePrefix='$BaselinePrefix' ChangesPrefix='$ChangesPrefix' TempPrefix='$TempPrefix'"
-
-try {
-  $azAccessTokenCmd = Get-Command Get-AzAccessToken -ErrorAction Stop
-  $source = if ($azAccessTokenCmd.Source) { $azAccessTokenCmd.Source } else { 'unknown' }
-  Write-RunbookLog -Message "Get-AzAccessToken command type '$($azAccessTokenCmd.CommandType)' source '$source'."
-} catch {
-  Write-RunbookLog -Level 'WARN' -Message 'Could not resolve Get-AzAccessToken command metadata.'
-  Write-ExceptionDetails -ErrorRecord $_
-}
-
-# ── 1. Authenticate ──────────────────────────────────────────────────────────
-Write-RunbookLog -Message 'Authenticating with managed identity...'
-try {
-  Disable-AzContextAutosave -Scope Process | Out-Null
-  Write-RunbookLog -Level 'DEBUG' -Message 'Disable-AzContextAutosave completed.'
-  Connect-AzAccount -Identity | Out-Null
-  Write-RunbookLog -Level 'DEBUG' -Message 'Connect-AzAccount -Identity completed.'
-} catch {
-  Write-RunbookLog -Level 'ERROR' -Message 'Managed identity authentication failed.'
-  Write-ExceptionDetails -ErrorRecord $_
-  throw
-}
-
-Write-RunbookLog -Level 'DEBUG' -Message 'Attempting to acquire Graph token...'
-try {
-  $graphToken = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com'
-  Write-RunbookLog -Level 'DEBUG' -Message "Graph token acquired. Type: $($graphToken.GetType().FullName)"
-} catch {
-  Write-RunbookLog -Level 'ERROR' -Message 'Failed to acquire Graph token.'
-  Write-ExceptionDetails -ErrorRecord $_
-  throw
-}
-
-Write-RunbookLog -Level 'DEBUG' -Message 'Attempting to acquire Storage token...'
-try {
-  $storageToken = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com'
-  Write-RunbookLog -Level 'DEBUG' -Message "Storage token acquired. Type: $($storageToken.GetType().FullName)"
-} catch {
-  Write-RunbookLog -Level 'ERROR' -Message 'Failed to acquire Storage token.'
-  Write-ExceptionDetails -ErrorRecord $_
-  throw
-}
-
-$now          = [DateTime]::UtcNow
-$stamp        = $now.ToString('yyyyMMddTHHmmssZ')
-$nowIso       = $now.ToString('o')
-
-# ── 2. Collect live policy data from Graph ───────────────────────────────────
-Write-RunbookLog -Message 'Querying Microsoft Graph for Intune policies...'
-try {
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching configuration policies (Settings Catalog)...'
-  $configPolicies  = Invoke-GraphPagedGet -Path '/beta/deviceManagement/configurationPolicies?$top=999' -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Configuration policies returned: $($configPolicies.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching device configurations (legacy)...'
-  $deviceConfigs   = Invoke-GraphPagedGet -Path '/beta/deviceManagement/deviceConfigurations?$top=999' -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Device configurations returned: $($deviceConfigs.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching endpoint security intents...'
-  $securityPolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/intents?$top=999' -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Security intents returned: $($securityPolicies.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching compliance policies...'
-  $compliancePolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/deviceCompliancePolicies?$top=999' -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Compliance policies returned: $($compliancePolicies.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching group policy (ADMX) configurations...'
-  $groupPolicies = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/groupPolicyConfigurations?$top=999' -Token $graphToken -Label 'groupPolicyConfigurations'
-  Write-RunbookLog -Level 'DEBUG' -Message "Group policy configurations returned: $($groupPolicies.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Windows Update rings...'
-  $updateRings = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsUpdateForBusinessConfigurations?$top=999' -Token $graphToken -Label 'windowsUpdateForBusinessConfigurations'
-  Write-RunbookLog -Level 'DEBUG' -Message "Update rings returned: $($updateRings.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Windows Feature Update profiles...'
-  $featureUpdateProfiles = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsFeatureUpdateProfiles?$top=999' -Token $graphToken -Label 'windowsFeatureUpdateProfiles'
-  Write-RunbookLog -Level 'DEBUG' -Message "Feature update profiles returned: $($featureUpdateProfiles.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Windows Quality Update profiles...'
-  $qualityUpdateProfiles = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsQualityUpdateProfiles?$top=999' -Token $graphToken -Label 'windowsQualityUpdateProfiles'
-  Write-RunbookLog -Level 'DEBUG' -Message "Quality update profiles returned: $($qualityUpdateProfiles.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Windows Driver Update profiles...'
-  $driverUpdateProfiles = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsDriverUpdateProfiles?$top=999' -Token $graphToken -Label 'windowsDriverUpdateProfiles'
-  Write-RunbookLog -Level 'DEBUG' -Message "Driver update profiles returned: $($driverUpdateProfiles.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching PowerShell / platform scripts...'
-  $managementScripts = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/deviceManagementScripts?$top=999' -Token $graphToken -Label 'deviceManagementScripts'
-  Write-RunbookLog -Level 'DEBUG' -Message "Management scripts returned: $($managementScripts.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching proactive remediation (health) scripts...'
-  $healthScripts = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/deviceHealthScripts?$top=999' -Token $graphToken -Label 'deviceHealthScripts'
-  Write-RunbookLog -Level 'DEBUG' -Message "Health scripts returned: $($healthScripts.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching shell scripts...'
-  $shellScripts = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/deviceShellScripts?$top=999' -Token $graphToken -Label 'deviceShellScripts'
-  Write-RunbookLog -Level 'DEBUG' -Message "Shell scripts returned: $($shellScripts.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching enrollment configurations...'
-  $enrollmentConfigs = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/deviceEnrollmentConfigurations?$top=999' -Token $graphToken -Label 'deviceEnrollmentConfigurations'
-  Write-RunbookLog -Level 'DEBUG' -Message "Enrollment configurations returned: $($enrollmentConfigs.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Autopilot deployment profiles...'
-  $autopilotProfiles = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsAutopilotDeploymentProfiles?$top=999' -Token $graphToken -Label 'windowsAutopilotDeploymentProfiles'
-  Write-RunbookLog -Level 'DEBUG' -Message "Autopilot profiles returned: $($autopilotProfiles.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching app protection (MAM) policies...'
-  $appProtectionPolicies = Try-Invoke-GraphCollection -Path '/beta/deviceAppManagement/managedAppPolicies?$top=999' -Token $graphToken -Label 'managedAppPolicies'
-  Write-RunbookLog -Level 'DEBUG' -Message "App protection policies returned: $($appProtectionPolicies.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Conditional Access policies...'
-  $conditionalAccessPolicies = Try-Invoke-GraphCollection -Path '/v1.0/identity/conditionalAccess/policies?$top=999' -Token $graphToken -Label 'conditionalAccessPolicies'
-  Write-RunbookLog -Level 'DEBUG' -Message "Conditional Access policies returned: $($conditionalAccessPolicies.Count)"
-
-  # ── Resolve full content for each family ─────────────────────────────────
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving configuration policy content...'
-  $configPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'configuration' -Items $configPolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Configuration policies resolved: $($configPoliciesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving device configuration content...'
-  $deviceConfigsFull = Resolve-IntunePolicyContentCollection -PolicyType 'device' -Items $deviceConfigs -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Device configurations resolved: $($deviceConfigsFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving security intent content...'
-  $securityPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'security' -Items $securityPolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Security intents resolved: $($securityPoliciesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving compliance policy content...'
-  $compliancePoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'compliance' -Items $compliancePolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Compliance policies resolved: $($compliancePoliciesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving group policy content...'
-  $groupPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'groupPolicy' -Items $groupPolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Group policy configurations resolved: $($groupPoliciesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving update ring content...'
-  $updateRingsFull = Resolve-IntunePolicyContentCollection -PolicyType 'updateRing' -Items $updateRings -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Update rings resolved: $($updateRingsFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving feature update profile content...'
-  $featureUpdateProfilesFull = Resolve-IntunePolicyContentCollection -PolicyType 'featureUpdate' -Items $featureUpdateProfiles -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Feature update profiles resolved: $($featureUpdateProfilesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving quality update profile content...'
-  $qualityUpdateProfilesFull = Resolve-IntunePolicyContentCollection -PolicyType 'qualityUpdate' -Items $qualityUpdateProfiles -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Quality update profiles resolved: $($qualityUpdateProfilesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving driver update profile content...'
-  $driverUpdateProfilesFull = Resolve-IntunePolicyContentCollection -PolicyType 'driverUpdate' -Items $driverUpdateProfiles -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Driver update profiles resolved: $($driverUpdateProfilesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving management script content...'
-  $managementScriptsFull = Resolve-IntunePolicyContentCollection -PolicyType 'script' -Items $managementScripts -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Management scripts resolved: $($managementScriptsFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving health script content...'
-  $healthScriptsFull = Resolve-IntunePolicyContentCollection -PolicyType 'healthScript' -Items $healthScripts -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Health scripts resolved: $($healthScriptsFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving shell script content...'
-  $shellScriptsFull = Resolve-IntunePolicyContentCollection -PolicyType 'shellScript' -Items $shellScripts -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Shell scripts resolved: $($shellScriptsFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving enrollment configuration content...'
-  $enrollmentConfigsFull = Resolve-IntunePolicyContentCollection -PolicyType 'enrollment' -Items $enrollmentConfigs -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Enrollment configurations resolved: $($enrollmentConfigsFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving Autopilot profile content...'
-  $autopilotProfilesFull = Resolve-IntunePolicyContentCollection -PolicyType 'autopilot' -Items $autopilotProfiles -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Autopilot profiles resolved: $($autopilotProfilesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving app protection policy content...'
-  $appProtectionPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'appProtection' -Items $appProtectionPolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "App protection policies resolved: $($appProtectionPoliciesFull.Count)"
-
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving Conditional Access policy content...'
-  $conditionalAccessPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'conditionalAccess' -Items $conditionalAccessPolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Conditional Access policies resolved: $($conditionalAccessPoliciesFull.Count)"
-} catch {
-  $errMsg = "Graph query failed: $_"
-  Write-RunbookLog -Level 'ERROR' -Message $errMsg
-  try {
-    Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-      -Note          $errMsg `
-      -DriftSummary  'Run failed — Graph query error' `
-      -Timestamp     $nowIso)
-  } catch {
-    Write-RunbookLog -Level 'WARN' -Message "Failed to write Graph error audit row: $($_.Exception.Message)"
-  }
-  throw
-}
-
-Write-RunbookLog -Message "  configurationPolicies         : $($configPolicies.Count)"
-Write-RunbookLog -Message "  deviceConfigurations          : $($deviceConfigs.Count)"
-Write-RunbookLog -Message "  securityIntents               : $($securityPolicies.Count)"
-Write-RunbookLog -Message "  compliancePolicies            : $($compliancePolicies.Count)"
-Write-RunbookLog -Message "  groupPolicyConfigurations     : $($groupPolicies.Count)"
-Write-RunbookLog -Message "  windowsUpdateRings            : $($updateRings.Count)"
-Write-RunbookLog -Message "  windowsFeatureUpdateProfiles  : $($featureUpdateProfiles.Count)"
-Write-RunbookLog -Message "  windowsQualityUpdateProfiles  : $($qualityUpdateProfiles.Count)"
-Write-RunbookLog -Message "  windowsDriverUpdateProfiles   : $($driverUpdateProfiles.Count)"
-Write-RunbookLog -Message "  deviceManagementScripts       : $($managementScripts.Count)"
-Write-RunbookLog -Message "  deviceHealthScripts           : $($healthScripts.Count)"
-Write-RunbookLog -Message "  deviceShellScripts            : $($shellScripts.Count)"
-Write-RunbookLog -Message "  enrollmentConfigurations      : $($enrollmentConfigs.Count)"
-Write-RunbookLog -Message "  autopilotProfiles             : $($autopilotProfiles.Count)"
-Write-RunbookLog -Message "  appProtectionPolicies         : $($appProtectionPolicies.Count)"
-Write-RunbookLog -Message "  conditionalAccessPolicies     : $($conditionalAccessPolicies.Count)"
-
-# ── 3. Build normalised current-state map ────────────────────────────────────
-$currentMap = Merge-PolicyMaps -Maps @(
-  (Build-PolicyMap -PolicyType 'configuration'     -Items $configPoliciesFull),
-  (Build-PolicyMap -PolicyType 'device'            -Items $deviceConfigsFull),
-  (Build-PolicyMap -PolicyType 'security'          -Items $securityPoliciesFull),
-  (Build-PolicyMap -PolicyType 'compliance'        -Items $compliancePoliciesFull),
-  (Build-PolicyMap -PolicyType 'groupPolicy'       -Items $groupPoliciesFull),
-  (Build-PolicyMap -PolicyType 'updateRing'        -Items $updateRingsFull),
-  (Build-PolicyMap -PolicyType 'featureUpdate'     -Items $featureUpdateProfilesFull),
-  (Build-PolicyMap -PolicyType 'qualityUpdate'     -Items $qualityUpdateProfilesFull),
-  (Build-PolicyMap -PolicyType 'driverUpdate'      -Items $driverUpdateProfilesFull),
-  (Build-PolicyMap -PolicyType 'script'            -Items $managementScriptsFull),
-  (Build-PolicyMap -PolicyType 'healthScript'      -Items $healthScriptsFull),
-  (Build-PolicyMap -PolicyType 'shellScript'       -Items $shellScriptsFull),
-  (Build-PolicyMap -PolicyType 'enrollment'        -Items $enrollmentConfigsFull),
-  (Build-PolicyMap -PolicyType 'autopilot'         -Items $autopilotProfilesFull),
-  (Build-PolicyMap -PolicyType 'appProtection'     -Items $appProtectionPoliciesFull),
-  (Build-PolicyMap -PolicyType 'conditionalAccess' -Items $conditionalAccessPoliciesFull)
-)
-
-$rawGraphTotal = $configPolicies.Count + $deviceConfigs.Count + $securityPolicies.Count + $compliancePolicies.Count + $groupPolicies.Count + $updateRings.Count + $featureUpdateProfiles.Count + $qualityUpdateProfiles.Count + $driverUpdateProfiles.Count + $managementScripts.Count + $healthScripts.Count + $shellScripts.Count + $enrollmentConfigs.Count + $autopilotProfiles.Count + $appProtectionPolicies.Count + $conditionalAccessPolicies.Count
-if ($rawGraphTotal -gt 0 -and $currentMap.Count -eq 0) {
-  $shapeError = 'Graph payload parse mismatch: endpoint counts were non-zero but normalized policy map is empty. Aborting to avoid creating an invalid baseline.'
-  Write-RunbookLog -Level 'ERROR' -Message $shapeError
-  try {
-    Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-      -Note         $shapeError `
-      -DriftSummary 'Run failed — graph payload parse mismatch' `
-      -DriftData    (@{ configuration = $configPolicies.Count; device = $deviceConfigs.Count; security = $securityPolicies.Count; compliance = $compliancePolicies.Count; groupPolicy = $groupPolicies.Count; updateRing = $updateRings.Count; featureUpdate = $featureUpdateProfiles.Count; qualityUpdate = $qualityUpdateProfiles.Count; driverUpdate = $driverUpdateProfiles.Count; script = $managementScripts.Count; healthScript = $healthScripts.Count; shellScript = $shellScripts.Count; enrollment = $enrollmentConfigs.Count; autopilot = $autopilotProfiles.Count; appProtection = $appProtectionPolicies.Count; conditionalAccess = $conditionalAccessPolicies.Count } | ConvertTo-Json -Compress) `
-      -Timestamp    $nowIso)
-  } catch {
-    Write-RunbookLog -Level 'WARN' -Message "Failed to write payload-shape error audit row: $($_.Exception.Message)"
-  }
-  throw $shapeError
-}
-
-Write-RunbookLog -Message "Total policies in scope: $($currentMap.Count)"
-
-$currentSnapshot = [ordered]@{
-  capturedAt   = $nowIso
-  tenantId     = $TenantId
-  policyCount  = $currentMap.Count
-  contentMode  = 'full-policy-with-settings'
-  policies     = $currentMap
-}
-$currentSnapshotJson = $currentSnapshot | ConvertTo-Json -Depth 100
-
-# Write in-flight snapshot so it can be inspected if the run aborts mid-way
-$currentPath = "$TempPrefix/$stamp/current.json"
-Write-StorageBlob -Token $storageToken -BlobPath $currentPath -Text $currentSnapshotJson
-
-# Write a raw full-content export blob for diagnostics and manual review.
-$fullExportPath = "$TempPrefix/$stamp/full-policy-export.json"
-$fullExportDoc = [ordered]@{
-  capturedAt             = $nowIso
-  tenantId               = $TenantId
-  configurationPolicies        = $configPoliciesFull
-  deviceConfigurations         = $deviceConfigsFull
-  securityIntents              = $securityPoliciesFull
-  compliancePolicies           = $compliancePoliciesFull
-  groupPolicyConfigurations    = $groupPoliciesFull
-  windowsUpdateRings           = $updateRingsFull
-  windowsFeatureUpdateProfiles = $featureUpdateProfilesFull
-  windowsQualityUpdateProfiles = $qualityUpdateProfilesFull
-  windowsDriverUpdateProfiles  = $driverUpdateProfilesFull
-  deviceManagementScripts      = $managementScriptsFull
-  deviceHealthScripts          = $healthScriptsFull
-  deviceShellScripts           = $shellScriptsFull
-  enrollmentConfigurations     = $enrollmentConfigsFull
-  autopilotProfiles            = $autopilotProfilesFull
-  appProtectionPolicies        = $appProtectionPoliciesFull
-  conditionalAccessPolicies    = $conditionalAccessPoliciesFull
-}
-Write-StorageBlob -Token $storageToken -BlobPath $fullExportPath `
-  -Text ($fullExportDoc | ConvertTo-Json -Depth 100)
-Write-RunbookLog -Message "Full policy content export written to '$fullExportPath'."
-
-# ── 4. Check for existing baseline ──────────────────────────────────────────
-$baselinePath = "$BaselinePrefix/current.json"
-$baselineUri  = "https://$StorageAccountName.blob.core.windows.net/$ContainerName/$baselinePath"
-
-$baselineExists = $false
-try {
-  Invoke-RestMethod -Method HEAD -Uri $baselineUri -Headers @{
-    Authorization  = "Bearer $storageToken"
-    'x-ms-version' = '2021-12-02'
-  } | Out-Null
-  $baselineExists = $true
-} catch {
-  # 404 = no baseline yet; any other error re-throws below after logging
-  if ($_.Exception.Response.StatusCode.value__ -ne 404) {
-    $errMsg = "Baseline HEAD check failed: $_"
-    Write-RunbookLog -Level 'ERROR' -Message $errMsg
-    try {
-      Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-        -Note         $errMsg `
-        -DriftSummary 'Run failed — baseline read error' `
-        -Timestamp    $nowIso)
-    } catch {
-      Write-RunbookLog -Level 'WARN' -Message "Failed to write baseline error audit row: $($_.Exception.Message)"
-    }
     throw
   }
 }
 
-# ── 5. First run — establish baseline ───────────────────────────────────────
-if (-not $baselineExists) {
-  Write-RunbookLog -Message 'No baseline found. Establishing initial baseline...'
-  Write-StorageBlob -Token $storageToken -BlobPath $baselinePath -Text $currentSnapshotJson
-  Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-    -Note         'Initial baseline established.' `
-    -DriftSummary "Baseline created with $($currentMap.Count) policies" `
-    -Timestamp    $nowIso)
-  Write-RunbookLog -Message 'Baseline created - run complete.'
-  return
+function Get-PolicyFamilies {
+  $families = @(
+    [ordered]@{
+      type = 'configuration'
+      listPath = '/beta/deviceManagement/configurationPolicies?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/configurationPolicies/{id}'
+      settingsPathTemplate = '/beta/deviceManagement/configurationPolicies/{id}/settings?`$top=1000'
+      assignmentsPathTemplate = '/beta/deviceManagement/configurationPolicies/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $false
+    },
+    [ordered]@{
+      type = 'deviceConfiguration'
+      listPath = '/beta/deviceManagement/deviceConfigurations?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/deviceConfigurations/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/deviceConfigurations/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $false
+    },
+    [ordered]@{
+      type = 'securityIntent'
+      listPath = '/beta/deviceManagement/intents?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/intents/{id}'
+      settingsPathTemplate = '/beta/deviceManagement/intents/{id}/settings?`$top=1000'
+      assignmentsPathTemplate = '/beta/deviceManagement/intents/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $false
+    },
+    [ordered]@{
+      type = 'compliance'
+      listPath = '/beta/deviceManagement/deviceCompliancePolicies?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/deviceCompliancePolicies/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/deviceCompliancePolicies/{id}/assignments?`$top=1000'
+      extraCollections = @{ '_scheduledActionsForRule' = '/beta/deviceManagement/deviceCompliancePolicies/{id}/scheduledActionsForRule?`$top=1000' }
+      optional = $false
+    },
+    [ordered]@{
+      type = 'groupPolicy'
+      listPath = '/beta/deviceManagement/groupPolicyConfigurations?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/groupPolicyConfigurations/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/groupPolicyConfigurations/{id}/assignments?`$top=1000'
+      extraCollections = @{ '_definitionValues' = '/beta/deviceManagement/groupPolicyConfigurations/{id}/definitionValues?`$top=1000' }
+      optional = $true
+    },
+    [ordered]@{
+      type = 'updateRing'
+      listPath = '/beta/deviceManagement/deviceConfigurations?$filter=isof(''microsoft.graph.windowsUpdateForBusinessConfiguration'')&$top=200'
+      detailPathTemplate = '/beta/deviceManagement/deviceConfigurations/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/deviceConfigurations/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'featureUpdate'
+      listPath = '/beta/deviceManagement/windowsFeatureUpdateProfiles?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/windowsFeatureUpdateProfiles/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/windowsFeatureUpdateProfiles/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'qualityUpdate'
+      listPath = '/beta/deviceManagement/windowsQualityUpdateProfiles?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/windowsQualityUpdateProfiles/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/windowsQualityUpdateProfiles/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'driverUpdate'
+      listPath = '/beta/deviceManagement/windowsDriverUpdateProfiles?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/windowsDriverUpdateProfiles/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/windowsDriverUpdateProfiles/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'script'
+      listPath = '/beta/deviceManagement/deviceManagementScripts?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/deviceManagementScripts/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/deviceManagementScripts/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'healthScript'
+      listPath = '/beta/deviceManagement/deviceHealthScripts?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/deviceHealthScripts/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/deviceHealthScripts/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'shellScript'
+      listPath = '/beta/deviceManagement/deviceShellScripts?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/deviceShellScripts/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/deviceShellScripts/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'enrollment'
+      listPath = '/beta/deviceManagement/deviceEnrollmentConfigurations?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/deviceEnrollmentConfigurations/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/deviceEnrollmentConfigurations/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'autopilot'
+      listPath = '/beta/deviceManagement/windowsAutopilotDeploymentProfiles?$top=200'
+      detailPathTemplate = '/beta/deviceManagement/windowsAutopilotDeploymentProfiles/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceManagement/windowsAutopilotDeploymentProfiles/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'appProtection'
+      listPath = '/beta/deviceAppManagement/managedAppPolicies?$top=200'
+      detailPathTemplate = '/beta/deviceAppManagement/managedAppPolicies/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = '/beta/deviceAppManagement/managedAppPolicies/{id}/assignments?`$top=1000'
+      extraCollections = @{}
+      optional = $true
+    },
+    [ordered]@{
+      type = 'conditionalAccess'
+      listPath = '/v1.0/identity/conditionalAccess/policies?$top=200'
+      detailPathTemplate = '/v1.0/identity/conditionalAccess/policies/{id}'
+      settingsPathTemplate = ''
+      assignmentsPathTemplate = ''
+      extraCollections = @{}
+      optional = $true
+    }
+  )
+
+  return $families
 }
 
-# ── 6. Read stored baseline ──────────────────────────────────────────────────
-Write-RunbookLog -Message 'Reading stored baseline for comparison...'
-$baselineResponse = Invoke-WebRequest -Method GET -Uri $baselineUri -Headers @{
-  Authorization  = "Bearer $storageToken"
-  'x-ms-version' = '2021-12-02'
-}
-$baseline    = ([string]$baselineResponse.Content) | ConvertFrom-Json -AsHashtable
-$baselineMap = $baseline.policies   # hashtable keyed by "<type>:<id>"
+function Resolve-PolicyContent {
+  param(
+    [Parameter(Mandatory = $true)] $Family,
+    [Parameter(Mandatory = $true)] $Policy,
+    [Parameter(Mandatory = $true)] [string]$Token
+  )
 
-# Guardrail: if current snapshot is unexpectedly much smaller than baseline,
-# skip drift projection to avoid false mass-removals from partial Graph reads.
-$baselineCounts = Get-PolicyTypeCounts -PolicyMap $baselineMap
-$currentCounts  = Get-PolicyTypeCounts -PolicyMap $currentMap
+  $policyId = Get-ObjectId -Object $Policy
+  if ([string]::IsNullOrWhiteSpace($policyId)) {
+    throw "Policy in family '$($Family.type)' has no id."
+  }
 
-Write-RunbookLog -Message "Baseline total: $($baselineMap.Count) (config=$($baselineCounts.configuration), device=$($baselineCounts.device), security=$($baselineCounts.security), compliance=$($baselineCounts.compliance), groupPolicy=$($baselineCounts.groupPolicy), updateRing=$($baselineCounts.updateRing), script=$($baselineCounts.script), enrollment=$($baselineCounts.enrollment), autopilot=$($baselineCounts.autopilot), appProtection=$($baselineCounts.appProtection), ca=$($baselineCounts.conditionalAccess))"
-Write-RunbookLog -Message "Current total  : $($currentMap.Count) (config=$($currentCounts.configuration), device=$($currentCounts.device), security=$($currentCounts.security), compliance=$($currentCounts.compliance), groupPolicy=$($currentCounts.groupPolicy), updateRing=$($currentCounts.updateRing), script=$($currentCounts.script), enrollment=$($currentCounts.enrollment), autopilot=$($currentCounts.autopilot), appProtection=$($currentCounts.appProtection), ca=$($currentCounts.conditionalAccess))"
+  $fallback = ConvertTo-Hashtable -InputObject $Policy
+  $content = @{}
 
-$currentCoverage = if ($baselineMap.Count -gt 0) { [double]$currentMap.Count / [double]$baselineMap.Count } else { 1.0 }
-$isSuspiciousDrop = $baselineMap.Count -ge 50 -and $currentCoverage -lt 0.6
+  $detailPath = ''
+  if (-not [string]::IsNullOrWhiteSpace([string]$Family.detailPathTemplate)) {
+    $detailPath = ([string]$Family.detailPathTemplate).Replace('{id}', $policyId)
+  }
 
-if ($isSuspiciousDrop) {
-  $coveragePct = [Math]::Round($currentCoverage * 100, 2)
-  $warnMessage = "Snapshot integrity check failed: current snapshot has $($currentMap.Count) policies vs baseline $($baselineMap.Count) (${coveragePct}% coverage). Skipping drift projection to prevent false removals."
-  Write-RunbookLog -Level 'WARN' -Message $warnMessage
-  Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-    -Note         $warnMessage `
-    -DriftSummary 'Run skipped — incomplete Graph snapshot' `
-    -DriftData    (@{ baselineCount = $baselineMap.Count; currentCount = $currentMap.Count; coverage = $currentCoverage } | ConvertTo-Json -Compress) `
-    -Timestamp    $nowIso)
-  return
-}
-
-# ── 7. Compute drift ─────────────────────────────────────────────────────────
-$driftEvents = Get-DriftEvents -Baseline $baselineMap -Current $currentMap -Timestamp $nowIso
-
-# ── 8a. No drift — write heartbeat and exit ──────────────────────────────────
-if ($driftEvents.Count -eq 0) {
-  Write-RunbookLog -Message 'No drift detected. Writing heartbeat.'
-  Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-    -Note         'Baseline compare complete — no changes.' `
-    -DriftSummary "0 changes across $($currentMap.Count) policies" `
-    -Timestamp    $nowIso)
-  return
-}
-
-# ── 8b. Drift detected — persist artifacts and table rows ────────────────────
-Write-RunbookLog -Message "Drift detected: $($driftEvents.Count) event(s). Persisting artifacts..."
-$changesRoot = "$ChangesPrefix/$stamp"
-
-foreach ($driftEvent in $driftEvents) {
-  $safeId      = ($driftEvent.policyId -replace '[^a-zA-Z0-9\-]', '_')
-  $changedBlob = "$changesRoot/$($driftEvent.policyType)/$safeId.json"
-
-  # Blob payload: full current object for added/modified; tombstone for removed
-  if ($driftEvent.changeType -eq 'removed') {
-    $blobBody = [ordered]@{
-      policyId      = $driftEvent.policyId
-      policyType    = $driftEvent.policyType
-      policyName    = $driftEvent.policyName
-      changeType    = 'removed'
-      previousHash  = $driftEvent.previousHash
-      currentHash   = ''
-      changedFields = @()
-      modifiedAt    = $driftEvent.modifiedAt
+  if (-not [string]::IsNullOrWhiteSpace($detailPath)) {
+    $detailObj = Invoke-GraphDetailOptional -Path $detailPath -Token $Token -Label "$($Family.type)-detail"
+    if ($null -ne $detailObj) {
+      $content = ConvertTo-Hashtable -InputObject $detailObj
+    } else {
+      $content = $fallback
     }
   } else {
-    $blobBody = $currentMap[$driftEvent.policyKey]
+    $content = $fallback
   }
 
-  Write-StorageBlob -Token $storageToken -BlobPath $changedBlob `
-    -Text ($blobBody | ConvertTo-Json -Depth 100)
-
-  # One TenantPolicyDriftEvents row per changed policy.
-  # driftData serialises as a JSON array of {field, previousValue, currentValue}
-  # matching the PolicyDriftItem interface consumed by the React app.
-  $driftDataJson = Build-DriftDataJson `
-    -DriftItems $driftEvent.driftItems `
-    -FallbackPrevious $driftEvent.previousHash `
-    -FallbackCurrent $driftEvent.currentHash
-
-  Write-TableEntity -Token $storageToken -TableName 'TenantPolicyDriftEvents' -Entity @{
-    PartitionKey  = $TenantId
-    RowKey        = [guid]::NewGuid().ToString()
-    policyId      = $driftEvent.policyId
-    policyType    = $driftEvent.policyType
-    policyName    = $driftEvent.policyName
-    modifiedBy    = 'automation-account'
-    modifiedAt    = $driftEvent.modifiedAt
-    driftSummary  = ('{0} [{1}] - {2}' -f $driftEvent.changeType.ToUpperInvariant(), $driftEvent.policyType, $driftEvent.policyName)
-    driftData     = $driftDataJson
-    source        = 'system'
-    timestamp     = $nowIso
+  if (-not $content.ContainsKey('id') -or [string]::IsNullOrWhiteSpace([string]$content['id'])) {
+    $content['id'] = $policyId
   }
 
-  Write-RunbookLog -Message "  [$($driftEvent.changeType.ToUpper())] $($driftEvent.policyType):$($driftEvent.policyId) - $($driftEvent.policyName)"
+  $settingsTemplate = [string]$Family.settingsPathTemplate
+  if (-not [string]::IsNullOrWhiteSpace($settingsTemplate)) {
+    $settingsPath = $settingsTemplate.Replace('{id}', $policyId)
+    try {
+      $settings = Try-Invoke-GraphCollection -Path $settingsPath -Token $Token -Label "$($Family.type)-settings" -Optional $true
+      if (@($settings).Count -gt 0) {
+        $content['_settings'] = @($settings)
+      }
+    } catch {
+      Write-RunbookLog -Level 'WARN' -Message "Unable to load settings for '$($Family.type)' id '$policyId'."
+    }
+  }
+
+  $assignmentsTemplate = [string]$Family.assignmentsPathTemplate
+  if (-not [string]::IsNullOrWhiteSpace($assignmentsTemplate)) {
+    $assignmentsPath = $assignmentsTemplate.Replace('{id}', $policyId)
+    try {
+      $assignments = Try-Invoke-GraphCollection -Path $assignmentsPath -Token $Token -Label "$($Family.type)-assignments" -Optional $true
+      if (@($assignments).Count -gt 0) {
+        $content['_assignments'] = @($assignments)
+      }
+    } catch {
+      Write-RunbookLog -Level 'WARN' -Message "Unable to load assignments for '$($Family.type)' id '$policyId'."
+    }
+  }
+
+  foreach ($extraKey in $Family.extraCollections.Keys) {
+    $extraTemplate = [string]$Family.extraCollections[$extraKey]
+    $extraPath = $extraTemplate.Replace('{id}', $policyId)
+    try {
+      $items = Try-Invoke-GraphCollection -Path $extraPath -Token $Token -Label "$($Family.type)-$extraKey" -Optional $true
+      if (@($items).Count -gt 0) {
+        $content[$extraKey] = @($items)
+      }
+    } catch {
+      Write-RunbookLog -Level 'WARN' -Message "Unable to load '$extraKey' for '$($Family.type)' id '$policyId'."
+    }
+  }
+
+  return $content
 }
 
-# Run index blob (human-readable summary of the run)
-$indexDoc = [ordered]@{
-  runAt        = $nowIso
-  tenantId     = $TenantId
-  changeCount  = $driftEvents.Count
-  baselinePath = $baselinePath
-  tempPath     = $currentPath
-  changes      = $driftEvents | Select-Object policyKey, policyId, policyType, policyName, changeType, modifiedAt, changedFields
+function Get-AllIntunePolicies {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Token
+  )
+
+  $all = [System.Collections.Generic.List[object]]::new()
+  $families = Get-PolicyFamilies
+
+  foreach ($family in $families) {
+    Write-RunbookLog -Level 'INFO' -Message "Fetching family '$($family.type)' ..."
+    $items = Try-Invoke-GraphCollection -Path ([string]$family.listPath) -Token $Token -Label ([string]$family.type) -Optional ([bool]$family.optional)
+    Write-RunbookLog -Level 'INFO' -Message "Family '$($family.type)' returned $(@($items).Count) item(s)."
+
+    $i = 0
+    $total = @($items).Count
+    foreach ($item in $items) {
+      $i++
+      if (($i % 20) -eq 0 -or $i -eq $total) {
+        Write-RunbookLog -Level 'DEBUG' -Message "Resolving content for '$($family.type)': $i/$total"
+      }
+
+      $policyId = Get-ObjectId -Object $item
+      if ([string]::IsNullOrWhiteSpace($policyId)) {
+        Write-RunbookLog -Level 'WARN' -Message "Skipping item without id in family '$($family.type)'."
+        continue
+      }
+
+      $resolved = Resolve-PolicyContent -Family $family -Policy $item -Token $Token
+      $policyName = Get-ObjectName -Object $resolved
+
+      $record = [ordered]@{
+        policyType = [string]$family.type
+        policyId = [string]$policyId
+        policyName = [string]$policyName
+        content = $resolved
+      }
+
+      [void]$all.Add($record)
+    }
+  }
+
+  return @($all)
 }
-Write-StorageBlob -Token $storageToken -BlobPath "$changesRoot/index.json" `
-  -Text ($indexDoc | ConvertTo-Json -Depth 10)
 
-# Audit trail summary row
-Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-  -Note         "Drift run complete. $($driftEvents.Count) event(s) stored under $changesRoot." `
-  -DriftSummary "$($driftEvents.Count) change(s) across $($currentMap.Count) policies" `
-  -DriftData    (@{ changesRoot = $changesRoot; changeCount = $driftEvents.Count } | ConvertTo-Json -Compress) `
-  -Timestamp    $nowIso)
+function Get-StorageHeaders {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Token,
+    [Parameter(Mandatory = $false)] [string]$ContentType = ''
+  )
 
-# ── 9. Roll the baseline forward ─────────────────────────────────────────────
-# Writing the current snapshot as the new baseline means the next scheduled run
-# only surfaces policies that changed *after* this run — not the same ones again.
-Write-RunbookLog -Message 'Rolling baseline forward to current snapshot...'
-Write-StorageBlob -Token $storageToken -BlobPath $baselinePath -Text $currentSnapshotJson
+  $headers = @{
+    Authorization = "Bearer $Token"
+    'x-ms-version' = $StorageApiVersion
+    'x-ms-date' = (Get-Date).ToUniversalTime().ToString('R')
+  }
 
-Write-RunbookLog -Message "=== Run complete. $($driftEvents.Count) drift event(s) recorded. ==="
+  if (-not [string]::IsNullOrWhiteSpace($ContentType)) {
+    $headers['Content-Type'] = $ContentType
+  }
 
-#endregion
+  return $headers
+}
+
+function New-BlobUrl {
+  param(
+    [Parameter(Mandatory = $true)] [string]$BlobPath,
+    [Parameter(Mandatory = $false)] [string]$Query = ''
+  )
+
+  $encodedPath = ($BlobPath -split '/') | ForEach-Object { [System.Uri]::EscapeDataString($_) } | Join-String -Separator '/'
+  $url = "https://$StorageAccountName.blob.core.windows.net/$ContainerName/$encodedPath"
+  if (-not [string]::IsNullOrWhiteSpace($Query)) {
+    return "$url`?$Query"
+  }
+
+  return $url
+}
+
+function Write-JsonBlob {
+  param(
+    [Parameter(Mandatory = $true)] [string]$BlobPath,
+    [Parameter(Mandatory = $true)] $Data,
+    [Parameter(Mandatory = $true)] [string]$StorageToken,
+    [Parameter(Mandatory = $false)] [bool]$SkipIfExists = $false
+  )
+
+  if ($SkipIfExists -and (Test-BlobExists -BlobPath $BlobPath -StorageToken $StorageToken)) {
+    return $false
+  }
+
+  $json = $Data | ConvertTo-Json -Depth 100
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+  $headers = Get-StorageHeaders -Token $StorageToken -ContentType 'application/json; charset=utf-8'
+  $headers['x-ms-blob-type'] = 'BlockBlob'
+
+  $url = New-BlobUrl -BlobPath $BlobPath
+  Invoke-RestMethod -Method Put -Uri $url -Headers $headers -Body $bytes -ErrorAction Stop | Out-Null
+  return $true
+}
+
+function Test-BlobExists {
+  param(
+    [Parameter(Mandatory = $true)] [string]$BlobPath,
+    [Parameter(Mandatory = $true)] [string]$StorageToken
+  )
+
+  $headers = Get-StorageHeaders -Token $StorageToken
+  $url = New-BlobUrl -BlobPath $BlobPath
+
+  try {
+    Invoke-WebRequest -Method Head -Uri $url -Headers $headers -UseBasicParsing -ErrorAction Stop | Out-Null
+    return $true
+  } catch {
+    $statusCode = Get-HttpStatusCode -ErrorRecord $_
+    if ($statusCode -eq 404) {
+      return $false
+    }
+
+    throw
+  }
+}
+
+function Read-JsonBlob {
+  param(
+    [Parameter(Mandatory = $true)] [string]$BlobPath,
+    [Parameter(Mandatory = $true)] [string]$StorageToken
+  )
+
+  $headers = Get-StorageHeaders -Token $StorageToken
+  $url = New-BlobUrl -BlobPath $BlobPath
+  return Invoke-RestMethod -Method Get -Uri $url -Headers $headers -ErrorAction Stop
+}
+
+function Get-BlobNamesByPrefix {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Prefix,
+    [Parameter(Mandatory = $true)] [string]$StorageToken
+  )
+
+  $headers = Get-StorageHeaders -Token $StorageToken
+  $names = [System.Collections.Generic.List[string]]::new()
+  $marker = ''
+
+  while ($true) {
+    $query = "restype=container&comp=list&prefix=$([System.Uri]::EscapeDataString($Prefix))&maxresults=5000"
+    if (-not [string]::IsNullOrWhiteSpace($marker)) {
+      $query = "$query&marker=$([System.Uri]::EscapeDataString($marker))"
+    }
+
+    $url = "https://$StorageAccountName.blob.core.windows.net/$ContainerName`?$query"
+    $response = Invoke-RestMethod -Method Get -Uri $url -Headers $headers -ErrorAction Stop
+
+    if ($response.EnumerationResults.Blobs -and $response.EnumerationResults.Blobs.Blob) {
+      foreach ($blob in @($response.EnumerationResults.Blobs.Blob)) {
+        [void]$names.Add([string]$blob.Name)
+      }
+    }
+
+    $nextMarker = [string]$response.EnumerationResults.NextMarker
+    if ([string]::IsNullOrWhiteSpace($nextMarker)) {
+      break
+    }
+
+    $marker = $nextMarker
+  }
+
+  return @($names)
+}
+
+function ConvertTo-NormalizedObject {
+  param([Parameter(Mandatory = $true)] $InputObject)
+
+  if ($null -eq $InputObject) { return $null }
+
+  if ($InputObject -is [System.Collections.IDictionary]) {
+    $ordered = [ordered]@{}
+    foreach ($key in ($InputObject.Keys | Sort-Object)) {
+      $ordered[[string]$key] = ConvertTo-NormalizedObject -InputObject $InputObject[$key]
+    }
+
+    return $ordered
+  }
+
+  if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
+    $arr = @()
+    foreach ($x in $InputObject) {
+      $arr += ,(ConvertTo-NormalizedObject -InputObject $x)
+    }
+
+    return $arr
+  }
+
+  return $InputObject
+}
+
+function Get-NormalizedJson {
+  param([Parameter(Mandatory = $true)] $Object)
+
+  $normalized = ConvertTo-NormalizedObject -InputObject $Object
+  return ($normalized | ConvertTo-Json -Depth 100 -Compress)
+}
+
+function Build-PolicyKey {
+  param(
+    [Parameter(Mandatory = $true)] [string]$PolicyType,
+    [Parameter(Mandatory = $true)] [string]$PolicyId
+  )
+
+  return ($PolicyType + ':' + $PolicyId)
+}
+
+function Save-PoliciesToPrefix {
+  param(
+    [Parameter(Mandatory = $true)] [array]$Policies,
+    [Parameter(Mandatory = $true)] [string]$Prefix,
+    [Parameter(Mandatory = $true)] [string]$StorageToken,
+    [Parameter(Mandatory = $false)] [bool]$SkipIfExists = $false
+  )
+
+  $savedCount = 0
+
+  foreach ($policy in $Policies) {
+    $type = [string]$policy.policyType
+    $id = [string]$policy.policyId
+    $blobPath = "$Prefix/$type/$id.json"
+
+    $wrote = Write-JsonBlob -BlobPath $blobPath -Data $policy.content -StorageToken $StorageToken -SkipIfExists $SkipIfExists
+    if ($wrote) {
+      $savedCount++
+    }
+  }
+
+  return $savedCount
+}
+
+function Compare-And-WriteChanges {
+  param(
+    [Parameter(Mandatory = $true)] [array]$TempPolicies,
+    [Parameter(Mandatory = $true)] [string]$BaselinePrefix,
+    [Parameter(Mandatory = $true)] [string]$ChangesPrefix,
+    [Parameter(Mandatory = $true)] [string]$StorageToken,
+    [Parameter(Mandatory = $true)] [string]$TimestampFolder
+  )
+
+  $changesWritten = 0
+  $currentKeys = [System.Collections.Generic.HashSet[string]]::new()
+
+  foreach ($policy in $TempPolicies) {
+    $type = [string]$policy.policyType
+    $id = [string]$policy.policyId
+    $name = [string]$policy.policyName
+
+    $key = Build-PolicyKey -PolicyType $type -PolicyId $id
+    [void]$currentKeys.Add($key)
+
+    $baselinePath = "$BaselinePrefix/$type/$id.json"
+    $changePath = "$ChangesPrefix/$TimestampFolder/$type/$id.json"
+
+    $baselineExists = Test-BlobExists -BlobPath $baselinePath -StorageToken $StorageToken
+    $currentJson = Get-NormalizedJson -Object $policy.content
+
+    if (-not $baselineExists) {
+      $doc = [ordered]@{
+        changeType = 'added'
+        policyType = $type
+        policyId = $id
+        policyName = $name
+        detectedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        baselineExists = $false
+        current = $policy.content
+      }
+
+      [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
+      $changesWritten++
+      continue
+    }
+
+    $baselineContent = Read-JsonBlob -BlobPath $baselinePath -StorageToken $StorageToken
+    $baselineJson = Get-NormalizedJson -Object $baselineContent
+
+    if ($baselineJson -ne $currentJson) {
+      $doc = [ordered]@{
+        changeType = 'modified'
+        policyType = $type
+        policyId = $id
+        policyName = $name
+        detectedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        baseline = $baselineContent
+        current = $policy.content
+      }
+
+      [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
+      $changesWritten++
+    }
+  }
+
+  $baselineBlobNames = Get-BlobNamesByPrefix -Prefix "$BaselinePrefix/" -StorageToken $StorageToken
+  foreach ($baselineBlob in $baselineBlobNames) {
+    if ($baselineBlob -like '*/_baseline.complete.json') { continue }
+    if ($baselineBlob -notlike '*.json') { continue }
+
+    $relative = $baselineBlob.Substring(("$BaselinePrefix/").Length)
+    $slash = $relative.IndexOf('/')
+    if ($slash -lt 1) { continue }
+
+    $type = $relative.Substring(0, $slash)
+    $fileName = $relative.Substring($slash + 1)
+    if (-not $fileName.EndsWith('.json')) { continue }
+
+    $id = $fileName.Substring(0, $fileName.Length - 5)
+    $key = Build-PolicyKey -PolicyType $type -PolicyId $id
+
+    if ($currentKeys.Contains($key)) { continue }
+
+    $baselineContent = Read-JsonBlob -BlobPath $baselineBlob -StorageToken $StorageToken
+    $changePath = "$ChangesPrefix/$TimestampFolder/$type/$id.json"
+
+    $doc = [ordered]@{
+      changeType = 'removed'
+      policyType = $type
+      policyId = $id
+      policyName = (Get-ObjectName -Object $baselineContent)
+      detectedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+      baseline = $baselineContent
+      current = $null
+    }
+
+    [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
+    $changesWritten++
+  }
+
+  return $changesWritten
+}
+
+try {
+  Write-RunbookLog -Message "=== Detect-PolicyDrift $($NowUtc.ToString('yyyy-MM-dd HH:mm:ssZ')) version=$ScriptVersion ==="
+  Write-RunbookLog -Message "Input parameters: TenantId='$TenantId' StorageAccountName='$StorageAccountName' ContainerName='$ContainerName' GraphBaseUrl='$GraphBaseUrl' BaselinePrefix='$BaselinePrefix' ChangesPrefix='$ChangesPrefix' TempPrefix='$TempPrefix'"
+
+  Write-RunbookLog -Level 'INFO' -Message 'Authenticating with managed identity...'
+  Disable-AzContextAutosave -Scope Process | Out-Null
+  Connect-AzAccount -Identity -Tenant $TenantId | Out-Null
+
+  $graphToken = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com/'
+  $storageToken = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com/'
+
+  Write-RunbookLog -Level 'INFO' -Message 'Collecting full Intune policy backup from Microsoft Graph...'
+  $policies = Get-AllIntunePolicies -Token $graphToken
+  Write-RunbookLog -Level 'INFO' -Message "Resolved total policy objects: $(@($policies).Count)"
+
+  $tempRoot = "$TempPrefix/$TimestampFolder"
+  $tempSaved = Save-PoliciesToPrefix -Policies $policies -Prefix $tempRoot -StorageToken $storageToken -SkipIfExists $false
+
+  $tempManifest = [ordered]@{
+    scriptVersion = $ScriptVersion
+    generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    totalPolicies = @($policies).Count
+    tempRoot = $tempRoot
+  }
+  [void](Write-JsonBlob -BlobPath "$tempRoot/_manifest.json" -Data $tempManifest -StorageToken $storageToken)
+  Write-RunbookLog -Level 'INFO' -Message "Temp snapshot written: '$tempRoot' with $tempSaved policy JSON file(s)."
+
+  $baselineMarkerPath = "$BaselinePrefix/_baseline.complete.json"
+  $baselineExists = Test-BlobExists -BlobPath $baselineMarkerPath -StorageToken $storageToken
+
+  if (-not $baselineExists) {
+    Write-RunbookLog -Level 'INFO' -Message "Baseline marker not found. Creating one-time baseline under '$BaselinePrefix/'."
+    $baselineSaved = Save-PoliciesToPrefix -Policies $policies -Prefix $BaselinePrefix -StorageToken $storageToken -SkipIfExists $true
+
+    $baselineDoc = [ordered]@{
+      createdAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+      scriptVersion = $ScriptVersion
+      totalPolicies = @($policies).Count
+      baselinePrefix = $BaselinePrefix
+      note = 'Baseline is write-once. Existing baseline policy files are not overwritten.'
+    }
+
+    [void](Write-JsonBlob -BlobPath $baselineMarkerPath -Data $baselineDoc -StorageToken $storageToken -SkipIfExists $true)
+    Write-RunbookLog -Level 'INFO' -Message "Baseline initialized. New baseline policy files written: $baselineSaved"
+  } else {
+    Write-RunbookLog -Level 'INFO' -Message "Baseline already exists at '$BaselinePrefix/'. Baseline files were not overwritten."
+  }
+
+  $changesWritten = Compare-And-WriteChanges -TempPolicies $policies -BaselinePrefix $BaselinePrefix -ChangesPrefix $ChangesPrefix -StorageToken $storageToken -TimestampFolder $TimestampFolder
+
+  $changesSummary = [ordered]@{
+    generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    scriptVersion = $ScriptVersion
+    baselinePrefix = $BaselinePrefix
+    tempRoot = $tempRoot
+    changesRoot = "$ChangesPrefix/$TimestampFolder"
+    totalPoliciesEvaluated = @($policies).Count
+    changedPolicies = $changesWritten
+  }
+
+  [void](Write-JsonBlob -BlobPath "$ChangesPrefix/$TimestampFolder/_summary.json" -Data $changesSummary -StorageToken $storageToken)
+  Write-RunbookLog -Level 'INFO' -Message "Changes written: $changesWritten file(s) under '$ChangesPrefix/$TimestampFolder/'."
+  Write-RunbookLog -Level 'INFO' -Message 'Runbook completed successfully.'
+} catch {
+  Write-RunbookLog -Level 'ERROR' -Message 'Unhandled terminating error in runbook.'
+  Write-ExceptionDetails -Exception $_.Exception
+  throw
+}
