@@ -72,7 +72,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$ScriptVersion = '2.13-content'
+$ScriptVersion = '2.14'
 $VerbosePreference = 'Continue'
 
 function Write-RunbookLog {
@@ -526,91 +526,154 @@ function Try-Invoke-GraphPagedGet {
 
 function Get-IntunePolicyContent {
   <#
-  .SYNOPSIS Resolves one Intune policy into a content-rich object with settings,
-            assignments, and additional detail collections when available.
+  .SYNOPSIS Resolves one Intune policy into a content-rich FLAT hashtable.
+            Settings, assignments, and extra collections are injected as
+            '_settings', '_assignments', etc. keys directly on the detail
+            object so that Build-PolicyMap sees 'id'/'displayName' at
+            the top level exactly as before.
+  Valid PolicyType values: configuration, device, security, compliance,
+    groupPolicy, updateRing, featureUpdate, qualityUpdate, driverUpdate,
+    script, healthScript, shellScript, enrollment, autopilot,
+    appProtection, conditionalAccess
   #>
   param(
-    [Parameter(Mandatory = $true)] [ValidateSet('configuration', 'device', 'security', 'compliance')] [string]$PolicyType,
+    [Parameter(Mandatory = $true)] [string]$PolicyType,
     [Parameter(Mandatory = $true)] $PolicyObject,
     [Parameter(Mandatory = $true)] $Token
   )
 
   $policyId = Get-IntunePolicyId -PolicyObject $PolicyObject
-  if ([string]::IsNullOrWhiteSpace($policyId)) {
-    return $PolicyObject
-  }
+
+  # Initialise all path variables so Set-StrictMode never fires on undefined vars.
+  $detailPath      = ''
+  $settingsPath    = ''
+  $assignmentsPath = ''
+  $extraPaths      = @{}
 
   switch ($PolicyType) {
     'configuration' {
       $detailPath      = "/beta/deviceManagement/configurationPolicies/$policyId"
-      $settingsPath    = "/beta/deviceManagement/configurationPolicies/$policyId/settings?$top=1000"
-      $assignmentsPath = "/beta/deviceManagement/configurationPolicies/$policyId/assignments?$top=1000"
+      $settingsPath    = "/beta/deviceManagement/configurationPolicies/$policyId/settings?`$top=1000"
+      $assignmentsPath = "/beta/deviceManagement/configurationPolicies/$policyId/assignments?`$top=1000"
     }
     'device' {
       $detailPath      = "/beta/deviceManagement/deviceConfigurations/$policyId"
-      $settingsPath    = ''
-      $assignmentsPath = "/beta/deviceManagement/deviceConfigurations/$policyId/assignments?$top=1000"
+      $assignmentsPath = "/beta/deviceManagement/deviceConfigurations/$policyId/assignments?`$top=1000"
     }
     'security' {
       $detailPath      = "/beta/deviceManagement/intents/$policyId"
-      $settingsPath    = "/beta/deviceManagement/intents/$policyId/settings?$top=1000"
-      $assignmentsPath = "/beta/deviceManagement/intents/$policyId/assignments?$top=1000"
+      $settingsPath    = "/beta/deviceManagement/intents/$policyId/settings?`$top=1000"
+      $assignmentsPath = "/beta/deviceManagement/intents/$policyId/assignments?`$top=1000"
     }
     'compliance' {
       $detailPath      = "/beta/deviceManagement/deviceCompliancePolicies/$policyId"
-      $settingsPath    = ''
-      $assignmentsPath = "/beta/deviceManagement/deviceCompliancePolicies/$policyId/assignments?$top=1000"
-      $actionsPath     = "/beta/deviceManagement/deviceCompliancePolicies/$policyId/scheduledActionsForRule?$top=1000"
+      $assignmentsPath = "/beta/deviceManagement/deviceCompliancePolicies/$policyId/assignments?`$top=1000"
+      $extraPaths['_scheduledActionsForRule'] = "/beta/deviceManagement/deviceCompliancePolicies/$policyId/scheduledActionsForRule?`$top=1000"
+    }
+    'groupPolicy' {
+      $detailPath      = "/beta/deviceManagement/groupPolicyConfigurations/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/groupPolicyConfigurations/$policyId/assignments?`$top=1000"
+      $extraPaths['_definitionValues'] = "/beta/deviceManagement/groupPolicyConfigurations/$policyId/definitionValues?`$top=1000"
+    }
+    'updateRing' {
+      $detailPath      = "/beta/deviceManagement/windowsUpdateForBusinessConfigurations/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/windowsUpdateForBusinessConfigurations/$policyId/assignments?`$top=1000"
+    }
+    'featureUpdate' {
+      $detailPath      = "/beta/deviceManagement/windowsFeatureUpdateProfiles/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/windowsFeatureUpdateProfiles/$policyId/assignments?`$top=1000"
+    }
+    'qualityUpdate' {
+      $detailPath      = "/beta/deviceManagement/windowsQualityUpdateProfiles/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/windowsQualityUpdateProfiles/$policyId/assignments?`$top=1000"
+    }
+    'driverUpdate' {
+      $detailPath      = "/beta/deviceManagement/windowsDriverUpdateProfiles/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/windowsDriverUpdateProfiles/$policyId/assignments?`$top=1000"
+    }
+    'script' {
+      $detailPath      = "/beta/deviceManagement/deviceManagementScripts/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/deviceManagementScripts/$policyId/assignments?`$top=1000"
+    }
+    'healthScript' {
+      $detailPath      = "/beta/deviceManagement/deviceHealthScripts/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/deviceHealthScripts/$policyId/assignments?`$top=1000"
+    }
+    'shellScript' {
+      $detailPath      = "/beta/deviceManagement/deviceShellScripts/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/deviceShellScripts/$policyId/assignments?`$top=1000"
+    }
+    'enrollment' {
+      $detailPath      = "/beta/deviceManagement/deviceEnrollmentConfigurations/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/deviceEnrollmentConfigurations/$policyId/assignments?`$top=1000"
+    }
+    'autopilot' {
+      $detailPath      = "/beta/deviceManagement/windowsAutopilotDeploymentProfiles/$policyId"
+      $assignmentsPath = "/beta/deviceManagement/windowsAutopilotDeploymentProfiles/$policyId/assignments?`$top=1000"
+    }
+    'appProtection' {
+      # App protection policies have type-specific endpoints; use list object as detail.
+      $detailPath = ''
+    }
+    'conditionalAccess' {
+      $detailPath = "/v1.0/identity/conditionalAccess/policies/$policyId"
     }
   }
 
-  $detail = $null
-  try {
-    $detail = Invoke-GraphGet -Path $detailPath -Token $Token
-  } catch {
-    Write-RunbookLog -Level 'WARN' -Message "Failed to resolve detailed policy payload for $PolicyType policy '$policyId'. Falling back to list object."
-    $detail = $PolicyObject
-  }
-
-  $assignments = @()
-  if (-not [string]::IsNullOrWhiteSpace($assignmentsPath)) {
+  # Fetch the detail object and convert to hashtable so 'id'/'displayName' are at
+  # the top level and Build-PolicyMap can read them without any special casing.
+  $contentHt = @{}
+  if (-not [string]::IsNullOrWhiteSpace($detailPath)) {
     try {
-      $assignments = Try-Invoke-GraphPagedGet -Path $assignmentsPath -Token $Token
+      $detailObj = Invoke-GraphGet -Path $detailPath -Token $Token
+      $contentHt = $detailObj | ConvertTo-Json -Depth 50 -Compress | ConvertFrom-Json -AsHashtable
     } catch {
-      Write-RunbookLog -Level 'WARN' -Message "Failed to load assignments for $PolicyType policy '$policyId'."
-      $assignments = @()
+      Write-RunbookLog -Level 'WARN' -Message "Failed to get detail for $PolicyType/$policyId; using list metadata."
+      try { $contentHt = $PolicyObject | ConvertTo-Json -Depth 50 -Compress | ConvertFrom-Json -AsHashtable } catch {}
+    }
+  } else {
+    try { $contentHt = $PolicyObject | ConvertTo-Json -Depth 50 -Compress | ConvertFrom-Json -AsHashtable } catch {}
+  }
+
+  # Guarantee 'id' is present even if the detail endpoint omitted it.
+  if (-not $contentHt.ContainsKey('id') -or [string]::IsNullOrWhiteSpace([string]$contentHt['id'])) {
+    if (-not [string]::IsNullOrWhiteSpace($policyId)) {
+      $contentHt['id'] = $policyId
     }
   }
 
-  $settings = @()
+  # Fetch settings (separate sub-resource endpoint).
   if (-not [string]::IsNullOrWhiteSpace($settingsPath)) {
     try {
-      $settings = Try-Invoke-GraphPagedGet -Path $settingsPath -Token $Token
+      $settingsItems = Try-Invoke-GraphPagedGet -Path $settingsPath -Token $Token
+      if (@($settingsItems).Count -gt 0) { $contentHt['_settings'] = $settingsItems }
     } catch {
-      Write-RunbookLog -Level 'WARN' -Message "Failed to load settings for $PolicyType policy '$policyId'."
-      $settings = @()
+      Write-RunbookLog -Level 'WARN' -Message "Failed to get settings for $PolicyType/$policyId."
     }
   }
 
-  $scheduledActionsForRule = @()
-  if ($PolicyType -eq 'compliance' -and -not [string]::IsNullOrWhiteSpace($actionsPath)) {
+  # Fetch assignments.
+  if (-not [string]::IsNullOrWhiteSpace($assignmentsPath)) {
     try {
-      $scheduledActionsForRule = Try-Invoke-GraphPagedGet -Path $actionsPath -Token $Token
+      $assignmentItems = Try-Invoke-GraphPagedGet -Path $assignmentsPath -Token $Token
+      if (@($assignmentItems).Count -gt 0) { $contentHt['_assignments'] = $assignmentItems }
     } catch {
-      Write-RunbookLog -Level 'WARN' -Message "Failed to load scheduled actions for compliance policy '$policyId'."
-      $scheduledActionsForRule = @()
+      Write-RunbookLog -Level 'WARN' -Message "Failed to get assignments for $PolicyType/$policyId."
     }
   }
 
-  return [ordered]@{
-    policyContentVersion     = 'full-v1'
-    policyType               = $PolicyType
-    id                       = $policyId
-    detail                   = $detail
-    assignments              = $assignments
-    settings                 = $settings
-    scheduledActionsForRule  = $scheduledActionsForRule
+  # Fetch any extra collections (scheduledActionsForRule, definitionValues, etc.).
+  foreach ($extraKey in $extraPaths.Keys) {
+    $extraPath = $extraPaths[$extraKey]
+    try {
+      $extraItems = Try-Invoke-GraphPagedGet -Path $extraPath -Token $Token
+      if (@($extraItems).Count -gt 0) { $contentHt[$extraKey] = $extraItems }
+    } catch {
+      Write-RunbookLog -Level 'WARN' -Message "Failed to get '$extraKey' for $PolicyType/$policyId."
+    }
   }
+
+  return $contentHt
 }
 
 function Resolve-IntunePolicyContentCollection {
@@ -618,7 +681,7 @@ function Resolve-IntunePolicyContentCollection {
   .SYNOPSIS Enriches each policy item with full content payload for drift hashing.
   #>
   param(
-    [Parameter(Mandatory = $true)] [ValidateSet('configuration', 'device', 'security', 'compliance')] [string]$PolicyType,
+    [Parameter(Mandatory = $true)] [string]$PolicyType,
     [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [array]$Items,
     [Parameter(Mandatory = $true)] $Token
   )
@@ -648,10 +711,22 @@ function Get-PolicyTypeCounts {
   )
 
   $counts = @{
-    configuration = 0
-    device        = 0
-    security      = 0
-    compliance    = 0
+    configuration   = 0
+    device          = 0
+    security        = 0
+    compliance      = 0
+    groupPolicy     = 0
+    updateRing      = 0
+    featureUpdate   = 0
+    qualityUpdate   = 0
+    driverUpdate    = 0
+    script          = 0
+    healthScript    = 0
+    shellScript     = 0
+    enrollment      = 0
+    autopilot       = 0
+    appProtection   = 0
+    conditionalAccess = 0
   }
 
   foreach ($entry in $PolicyMap.Values) {
@@ -782,42 +857,71 @@ function Build-PolicyMap {
     return $null
   }
 
-  $map = @{}
-  foreach ($item in $Items) {
-    $id = if ($item -is [System.Collections.IDictionary]) {
-      [string](& $getDictValue $item 'id')
-    } else {
-      $idProp = $item.PSObject.Properties['id']
-      if ($idProp) { [string]$idProp.Value } else { '' }
+  $getPolicyId = {
+    param($PolicyItem)
+
+    $candidate = [string](Get-CaseInsensitiveValue -Object $PolicyItem -Name 'id')
+    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+      return $candidate
     }
 
-    if ([string]::IsNullOrWhiteSpace($id)) { continue }
+    $candidate = [string](Get-CaseInsensitiveValue -Object $PolicyItem -Name 'policyId')
+    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+      return $candidate
+    }
+
+    $detail = Get-CaseInsensitiveValue -Object $PolicyItem -Name 'detail'
+    if ($null -ne $detail) {
+      $candidate = [string](Get-CaseInsensitiveValue -Object $detail -Name 'id')
+      if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        return $candidate
+      }
+    }
+
+    return ''
+  }
+
+  $getPolicyName = {
+    param($PolicyItem, [string]$FallbackId)
+
+    $candidateName = [string](Get-CaseInsensitiveValue -Object $PolicyItem -Name 'name')
+    if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
+      return $candidateName
+    }
+
+    $candidateDisplayName = [string](Get-CaseInsensitiveValue -Object $PolicyItem -Name 'displayName')
+    if (-not [string]::IsNullOrWhiteSpace($candidateDisplayName)) {
+      return $candidateDisplayName
+    }
+
+    $detail = Get-CaseInsensitiveValue -Object $PolicyItem -Name 'detail'
+    if ($null -ne $detail) {
+      $detailName = [string](Get-CaseInsensitiveValue -Object $detail -Name 'name')
+      if (-not [string]::IsNullOrWhiteSpace($detailName)) {
+        return $detailName
+      }
+
+      $detailDisplayName = [string](Get-CaseInsensitiveValue -Object $detail -Name 'displayName')
+      if (-not [string]::IsNullOrWhiteSpace($detailDisplayName)) {
+        return $detailDisplayName
+      }
+    }
+
+    return $FallbackId
+  }
+
+  $map = @{}
+  $skippedNoId = 0
+  foreach ($item in $Items) {
+    $id = [string](& $getPolicyId $item)
+
+    if ([string]::IsNullOrWhiteSpace($id)) {
+      $skippedNoId++
+      continue
+    }
 
     # Resolve display name — Graph uses 'name' or 'displayName' depending on endpoint
-    $name = if ($item -is [System.Collections.IDictionary]) {
-      $candidateName = [string](& $getDictValue $item 'name')
-      $candidateDisplayName = [string](& $getDictValue $item 'displayName')
-      if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
-        $candidateName
-      } elseif (-not [string]::IsNullOrWhiteSpace($candidateDisplayName)) {
-        $candidateDisplayName
-      } else {
-        $id
-      }
-    } else {
-      $nameProp = $item.PSObject.Properties['name']
-      $displayNameProp = $item.PSObject.Properties['displayName']
-      $candidateName = if ($nameProp) { [string]$nameProp.Value } else { '' }
-      $candidateDisplayName = if ($displayNameProp) { [string]$displayNameProp.Value } else { '' }
-
-      if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
-        $candidateName
-      } elseif (-not [string]::IsNullOrWhiteSpace($candidateDisplayName)) {
-        $candidateDisplayName
-      } else {
-        $id
-      }
-    }
+    $name = [string](& $getPolicyName $item $id)
 
     $normalized = ConvertTo-NormalizedObject $item
     $json       = $normalized | ConvertTo-Json -Depth 100 -Compress
@@ -830,6 +934,10 @@ function Build-PolicyMap {
       normalized = $normalized
       json       = $json
     }
+  }
+
+  if ($skippedNoId -gt 0) {
+    Write-RunbookLog -Level 'WARN' -Message "Build-PolicyMap skipped $skippedNoId '$PolicyType' item(s) because no id could be resolved."
   }
 
   return $map
@@ -849,6 +957,30 @@ function Merge-PolicyMaps {
     foreach ($k in $m.Keys) { $all[$k] = $m[$k] }
   }
   return $all
+}
+
+function Try-Invoke-GraphCollection {
+  <#
+  .SYNOPSIS Executes a Graph collection read and returns empty array on 403/404,
+            allowing optional policy families to be included without failing the run.
+  #>
+  param(
+    [Parameter(Mandatory = $true)] [string]$Path,
+    [Parameter(Mandatory = $true)] $Token,
+    [Parameter(Mandatory = $true)] [string]$Label
+  )
+
+  try {
+    return Invoke-GraphPagedGet -Path $Path -Token $Token
+  } catch {
+    $statusCode = Get-HttpStatusCode -ErrorRecord $_
+    if ($statusCode -eq 403 -or $statusCode -eq 404) {
+      Write-RunbookLog -Level 'WARN' -Message "Skipping optional Graph collection '$Label' ($Path). HTTP $statusCode."
+      return @()
+    }
+
+    throw
+  }
 }
 
 function Get-DriftEvents {
@@ -1278,37 +1410,134 @@ $nowIso       = $now.ToString('o')
 # ── 2. Collect live policy data from Graph ───────────────────────────────────
 Write-RunbookLog -Message 'Querying Microsoft Graph for Intune policies...'
 try {
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching configuration policies...'
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching configuration policies (Settings Catalog)...'
   $configPolicies  = Invoke-GraphPagedGet -Path '/beta/deviceManagement/configurationPolicies?$top=999' -Token $graphToken
   Write-RunbookLog -Level 'DEBUG' -Message "Configuration policies returned: $($configPolicies.Count)"
-  
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching device configurations...'
-  $deviceConfigs   = Invoke-GraphPagedGet -Path '/v1.0/deviceManagement/deviceConfigurations?$top=999' -Token $graphToken
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching device configurations (legacy)...'
+  $deviceConfigs   = Invoke-GraphPagedGet -Path '/beta/deviceManagement/deviceConfigurations?$top=999' -Token $graphToken
   Write-RunbookLog -Level 'DEBUG' -Message "Device configurations returned: $($deviceConfigs.Count)"
-  
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching security intents...'
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching endpoint security intents...'
   $securityPolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/intents?$top=999' -Token $graphToken
   Write-RunbookLog -Level 'DEBUG' -Message "Security intents returned: $($securityPolicies.Count)"
-  
-  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching security compliance policies...'
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching compliance policies...'
   $compliancePolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/deviceCompliancePolicies?$top=999' -Token $graphToken
   Write-RunbookLog -Level 'DEBUG' -Message "Compliance policies returned: $($compliancePolicies.Count)"
 
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving configuration policy content (detail/settings/assignments)...'
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching group policy (ADMX) configurations...'
+  $groupPolicies = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/groupPolicyConfigurations?$top=999' -Token $graphToken -Label 'groupPolicyConfigurations'
+  Write-RunbookLog -Level 'DEBUG' -Message "Group policy configurations returned: $($groupPolicies.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Windows Update rings...'
+  $updateRings = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsUpdateForBusinessConfigurations?$top=999' -Token $graphToken -Label 'windowsUpdateForBusinessConfigurations'
+  Write-RunbookLog -Level 'DEBUG' -Message "Update rings returned: $($updateRings.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Windows Feature Update profiles...'
+  $featureUpdateProfiles = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsFeatureUpdateProfiles?$top=999' -Token $graphToken -Label 'windowsFeatureUpdateProfiles'
+  Write-RunbookLog -Level 'DEBUG' -Message "Feature update profiles returned: $($featureUpdateProfiles.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Windows Quality Update profiles...'
+  $qualityUpdateProfiles = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsQualityUpdateProfiles?$top=999' -Token $graphToken -Label 'windowsQualityUpdateProfiles'
+  Write-RunbookLog -Level 'DEBUG' -Message "Quality update profiles returned: $($qualityUpdateProfiles.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Windows Driver Update profiles...'
+  $driverUpdateProfiles = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsDriverUpdateProfiles?$top=999' -Token $graphToken -Label 'windowsDriverUpdateProfiles'
+  Write-RunbookLog -Level 'DEBUG' -Message "Driver update profiles returned: $($driverUpdateProfiles.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching PowerShell / platform scripts...'
+  $managementScripts = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/deviceManagementScripts?$top=999' -Token $graphToken -Label 'deviceManagementScripts'
+  Write-RunbookLog -Level 'DEBUG' -Message "Management scripts returned: $($managementScripts.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching proactive remediation (health) scripts...'
+  $healthScripts = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/deviceHealthScripts?$top=999' -Token $graphToken -Label 'deviceHealthScripts'
+  Write-RunbookLog -Level 'DEBUG' -Message "Health scripts returned: $($healthScripts.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching shell scripts...'
+  $shellScripts = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/deviceShellScripts?$top=999' -Token $graphToken -Label 'deviceShellScripts'
+  Write-RunbookLog -Level 'DEBUG' -Message "Shell scripts returned: $($shellScripts.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching enrollment configurations...'
+  $enrollmentConfigs = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/deviceEnrollmentConfigurations?$top=999' -Token $graphToken -Label 'deviceEnrollmentConfigurations'
+  Write-RunbookLog -Level 'DEBUG' -Message "Enrollment configurations returned: $($enrollmentConfigs.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Autopilot deployment profiles...'
+  $autopilotProfiles = Try-Invoke-GraphCollection -Path '/beta/deviceManagement/windowsAutopilotDeploymentProfiles?$top=999' -Token $graphToken -Label 'windowsAutopilotDeploymentProfiles'
+  Write-RunbookLog -Level 'DEBUG' -Message "Autopilot profiles returned: $($autopilotProfiles.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching app protection (MAM) policies...'
+  $appProtectionPolicies = Try-Invoke-GraphCollection -Path '/beta/deviceAppManagement/managedAppPolicies?$top=999' -Token $graphToken -Label 'managedAppPolicies'
+  Write-RunbookLog -Level 'DEBUG' -Message "App protection policies returned: $($appProtectionPolicies.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Fetching Conditional Access policies...'
+  $conditionalAccessPolicies = Try-Invoke-GraphCollection -Path '/v1.0/identity/conditionalAccess/policies?$top=999' -Token $graphToken -Label 'conditionalAccessPolicies'
+  Write-RunbookLog -Level 'DEBUG' -Message "Conditional Access policies returned: $($conditionalAccessPolicies.Count)"
+
+  # ── Resolve full content for each family ─────────────────────────────────
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving configuration policy content...'
   $configPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'configuration' -Items $configPolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Configuration policy content objects resolved: $($configPoliciesFull.Count)"
+  Write-RunbookLog -Level 'DEBUG' -Message "Configuration policies resolved: $($configPoliciesFull.Count)"
 
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving device configuration content (detail/assignments)...'
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving device configuration content...'
   $deviceConfigsFull = Resolve-IntunePolicyContentCollection -PolicyType 'device' -Items $deviceConfigs -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Device configuration content objects resolved: $($deviceConfigsFull.Count)"
+  Write-RunbookLog -Level 'DEBUG' -Message "Device configurations resolved: $($deviceConfigsFull.Count)"
 
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving security intent content (detail/settings/assignments)...'
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving security intent content...'
   $securityPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'security' -Items $securityPolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Security intent content objects resolved: $($securityPoliciesFull.Count)"
+  Write-RunbookLog -Level 'DEBUG' -Message "Security intents resolved: $($securityPoliciesFull.Count)"
 
-  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving compliance policy content (detail/assignments/scheduled actions)...'
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving compliance policy content...'
   $compliancePoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'compliance' -Items $compliancePolicies -Token $graphToken
-  Write-RunbookLog -Level 'DEBUG' -Message "Compliance policy content objects resolved: $($compliancePoliciesFull.Count)"
+  Write-RunbookLog -Level 'DEBUG' -Message "Compliance policies resolved: $($compliancePoliciesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving group policy content...'
+  $groupPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'groupPolicy' -Items $groupPolicies -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Group policy configurations resolved: $($groupPoliciesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving update ring content...'
+  $updateRingsFull = Resolve-IntunePolicyContentCollection -PolicyType 'updateRing' -Items $updateRings -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Update rings resolved: $($updateRingsFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving feature update profile content...'
+  $featureUpdateProfilesFull = Resolve-IntunePolicyContentCollection -PolicyType 'featureUpdate' -Items $featureUpdateProfiles -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Feature update profiles resolved: $($featureUpdateProfilesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving quality update profile content...'
+  $qualityUpdateProfilesFull = Resolve-IntunePolicyContentCollection -PolicyType 'qualityUpdate' -Items $qualityUpdateProfiles -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Quality update profiles resolved: $($qualityUpdateProfilesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving driver update profile content...'
+  $driverUpdateProfilesFull = Resolve-IntunePolicyContentCollection -PolicyType 'driverUpdate' -Items $driverUpdateProfiles -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Driver update profiles resolved: $($driverUpdateProfilesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving management script content...'
+  $managementScriptsFull = Resolve-IntunePolicyContentCollection -PolicyType 'script' -Items $managementScripts -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Management scripts resolved: $($managementScriptsFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving health script content...'
+  $healthScriptsFull = Resolve-IntunePolicyContentCollection -PolicyType 'healthScript' -Items $healthScripts -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Health scripts resolved: $($healthScriptsFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving shell script content...'
+  $shellScriptsFull = Resolve-IntunePolicyContentCollection -PolicyType 'shellScript' -Items $shellScripts -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Shell scripts resolved: $($shellScriptsFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving enrollment configuration content...'
+  $enrollmentConfigsFull = Resolve-IntunePolicyContentCollection -PolicyType 'enrollment' -Items $enrollmentConfigs -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Enrollment configurations resolved: $($enrollmentConfigsFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving Autopilot profile content...'
+  $autopilotProfilesFull = Resolve-IntunePolicyContentCollection -PolicyType 'autopilot' -Items $autopilotProfiles -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Autopilot profiles resolved: $($autopilotProfilesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving app protection policy content...'
+  $appProtectionPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'appProtection' -Items $appProtectionPolicies -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "App protection policies resolved: $($appProtectionPoliciesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving Conditional Access policy content...'
+  $conditionalAccessPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'conditionalAccess' -Items $conditionalAccessPolicies -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Conditional Access policies resolved: $($conditionalAccessPoliciesFull.Count)"
 } catch {
   $errMsg = "Graph query failed: $_"
   Write-RunbookLog -Level 'ERROR' -Message $errMsg
@@ -1323,20 +1552,44 @@ try {
   throw
 }
 
-Write-RunbookLog -Message "  configurationPolicies : $($configPolicies.Count)"
-Write-RunbookLog -Message "  deviceConfigurations  : $($deviceConfigs.Count)"
-Write-RunbookLog -Message "  security intents      : $($securityPolicies.Count)"
-Write-RunbookLog -Message "  compliance policies   : $($compliancePolicies.Count)"
+Write-RunbookLog -Message "  configurationPolicies         : $($configPolicies.Count)"
+Write-RunbookLog -Message "  deviceConfigurations          : $($deviceConfigs.Count)"
+Write-RunbookLog -Message "  securityIntents               : $($securityPolicies.Count)"
+Write-RunbookLog -Message "  compliancePolicies            : $($compliancePolicies.Count)"
+Write-RunbookLog -Message "  groupPolicyConfigurations     : $($groupPolicies.Count)"
+Write-RunbookLog -Message "  windowsUpdateRings            : $($updateRings.Count)"
+Write-RunbookLog -Message "  windowsFeatureUpdateProfiles  : $($featureUpdateProfiles.Count)"
+Write-RunbookLog -Message "  windowsQualityUpdateProfiles  : $($qualityUpdateProfiles.Count)"
+Write-RunbookLog -Message "  windowsDriverUpdateProfiles   : $($driverUpdateProfiles.Count)"
+Write-RunbookLog -Message "  deviceManagementScripts       : $($managementScripts.Count)"
+Write-RunbookLog -Message "  deviceHealthScripts           : $($healthScripts.Count)"
+Write-RunbookLog -Message "  deviceShellScripts            : $($shellScripts.Count)"
+Write-RunbookLog -Message "  enrollmentConfigurations      : $($enrollmentConfigs.Count)"
+Write-RunbookLog -Message "  autopilotProfiles             : $($autopilotProfiles.Count)"
+Write-RunbookLog -Message "  appProtectionPolicies         : $($appProtectionPolicies.Count)"
+Write-RunbookLog -Message "  conditionalAccessPolicies     : $($conditionalAccessPolicies.Count)"
 
 # ── 3. Build normalised current-state map ────────────────────────────────────
 $currentMap = Merge-PolicyMaps -Maps @(
-  (Build-PolicyMap -PolicyType 'configuration' -Items $configPoliciesFull),
-  (Build-PolicyMap -PolicyType 'device'        -Items $deviceConfigsFull),
-  (Build-PolicyMap -PolicyType 'security'      -Items $securityPoliciesFull),
-  (Build-PolicyMap -PolicyType 'compliance'    -Items $compliancePoliciesFull)
+  (Build-PolicyMap -PolicyType 'configuration'     -Items $configPoliciesFull),
+  (Build-PolicyMap -PolicyType 'device'            -Items $deviceConfigsFull),
+  (Build-PolicyMap -PolicyType 'security'          -Items $securityPoliciesFull),
+  (Build-PolicyMap -PolicyType 'compliance'        -Items $compliancePoliciesFull),
+  (Build-PolicyMap -PolicyType 'groupPolicy'       -Items $groupPoliciesFull),
+  (Build-PolicyMap -PolicyType 'updateRing'        -Items $updateRingsFull),
+  (Build-PolicyMap -PolicyType 'featureUpdate'     -Items $featureUpdateProfilesFull),
+  (Build-PolicyMap -PolicyType 'qualityUpdate'     -Items $qualityUpdateProfilesFull),
+  (Build-PolicyMap -PolicyType 'driverUpdate'      -Items $driverUpdateProfilesFull),
+  (Build-PolicyMap -PolicyType 'script'            -Items $managementScriptsFull),
+  (Build-PolicyMap -PolicyType 'healthScript'      -Items $healthScriptsFull),
+  (Build-PolicyMap -PolicyType 'shellScript'       -Items $shellScriptsFull),
+  (Build-PolicyMap -PolicyType 'enrollment'        -Items $enrollmentConfigsFull),
+  (Build-PolicyMap -PolicyType 'autopilot'         -Items $autopilotProfilesFull),
+  (Build-PolicyMap -PolicyType 'appProtection'     -Items $appProtectionPoliciesFull),
+  (Build-PolicyMap -PolicyType 'conditionalAccess' -Items $conditionalAccessPoliciesFull)
 )
 
-$rawGraphTotal = $configPolicies.Count + $deviceConfigs.Count + $securityPolicies.Count + $compliancePolicies.Count
+$rawGraphTotal = $configPolicies.Count + $deviceConfigs.Count + $securityPolicies.Count + $compliancePolicies.Count + $groupPolicies.Count + $updateRings.Count + $featureUpdateProfiles.Count + $qualityUpdateProfiles.Count + $driverUpdateProfiles.Count + $managementScripts.Count + $healthScripts.Count + $shellScripts.Count + $enrollmentConfigs.Count + $autopilotProfiles.Count + $appProtectionPolicies.Count + $conditionalAccessPolicies.Count
 if ($rawGraphTotal -gt 0 -and $currentMap.Count -eq 0) {
   $shapeError = 'Graph payload parse mismatch: endpoint counts were non-zero but normalized policy map is empty. Aborting to avoid creating an invalid baseline.'
   Write-RunbookLog -Level 'ERROR' -Message $shapeError
@@ -1344,7 +1597,7 @@ if ($rawGraphTotal -gt 0 -and $currentMap.Count -eq 0) {
     Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
       -Note         $shapeError `
       -DriftSummary 'Run failed — graph payload parse mismatch' `
-      -DriftData    (@{ configuration = $configPolicies.Count; device = $deviceConfigs.Count; security = $securityPolicies.Count; compliance = $compliancePolicies.Count } | ConvertTo-Json -Compress) `
+      -DriftData    (@{ configuration = $configPolicies.Count; device = $deviceConfigs.Count; security = $securityPolicies.Count; compliance = $compliancePolicies.Count; groupPolicy = $groupPolicies.Count; updateRing = $updateRings.Count; featureUpdate = $featureUpdateProfiles.Count; qualityUpdate = $qualityUpdateProfiles.Count; driverUpdate = $driverUpdateProfiles.Count; script = $managementScripts.Count; healthScript = $healthScripts.Count; shellScript = $shellScripts.Count; enrollment = $enrollmentConfigs.Count; autopilot = $autopilotProfiles.Count; appProtection = $appProtectionPolicies.Count; conditionalAccess = $conditionalAccessPolicies.Count } | ConvertTo-Json -Compress) `
       -Timestamp    $nowIso)
   } catch {
     Write-RunbookLog -Level 'WARN' -Message "Failed to write payload-shape error audit row: $($_.Exception.Message)"
@@ -1372,10 +1625,22 @@ $fullExportPath = "$TempPrefix/$stamp/full-policy-export.json"
 $fullExportDoc = [ordered]@{
   capturedAt             = $nowIso
   tenantId               = $TenantId
-  configurationPolicies  = $configPoliciesFull
-  deviceConfigurations   = $deviceConfigsFull
-  securityIntents        = $securityPoliciesFull
-  compliancePolicies     = $compliancePoliciesFull
+  configurationPolicies        = $configPoliciesFull
+  deviceConfigurations         = $deviceConfigsFull
+  securityIntents              = $securityPoliciesFull
+  compliancePolicies           = $compliancePoliciesFull
+  groupPolicyConfigurations    = $groupPoliciesFull
+  windowsUpdateRings           = $updateRingsFull
+  windowsFeatureUpdateProfiles = $featureUpdateProfilesFull
+  windowsQualityUpdateProfiles = $qualityUpdateProfilesFull
+  windowsDriverUpdateProfiles  = $driverUpdateProfilesFull
+  deviceManagementScripts      = $managementScriptsFull
+  deviceHealthScripts          = $healthScriptsFull
+  deviceShellScripts           = $shellScriptsFull
+  enrollmentConfigurations     = $enrollmentConfigsFull
+  autopilotProfiles            = $autopilotProfilesFull
+  appProtectionPolicies        = $appProtectionPoliciesFull
+  conditionalAccessPolicies    = $conditionalAccessPoliciesFull
 }
 Write-StorageBlob -Token $storageToken -BlobPath $fullExportPath `
   -Text ($fullExportDoc | ConvertTo-Json -Depth 100)
@@ -1435,8 +1700,8 @@ $baselineMap = $baseline.policies   # hashtable keyed by "<type>:<id>"
 $baselineCounts = Get-PolicyTypeCounts -PolicyMap $baselineMap
 $currentCounts  = Get-PolicyTypeCounts -PolicyMap $currentMap
 
-Write-RunbookLog -Message "Baseline policy counts: configuration=$($baselineCounts.configuration), device=$($baselineCounts.device), security=$($baselineCounts.security), compliance=$($baselineCounts.compliance), total=$($baselineMap.Count)"
-Write-RunbookLog -Message "Current policy counts : configuration=$($currentCounts.configuration), device=$($currentCounts.device), security=$($currentCounts.security), compliance=$($currentCounts.compliance), total=$($currentMap.Count)"
+Write-RunbookLog -Message "Baseline total: $($baselineMap.Count) (config=$($baselineCounts.configuration), device=$($baselineCounts.device), security=$($baselineCounts.security), compliance=$($baselineCounts.compliance), groupPolicy=$($baselineCounts.groupPolicy), updateRing=$($baselineCounts.updateRing), script=$($baselineCounts.script), enrollment=$($baselineCounts.enrollment), autopilot=$($baselineCounts.autopilot), appProtection=$($baselineCounts.appProtection), ca=$($baselineCounts.conditionalAccess))"
+Write-RunbookLog -Message "Current total  : $($currentMap.Count) (config=$($currentCounts.configuration), device=$($currentCounts.device), security=$($currentCounts.security), compliance=$($currentCounts.compliance), groupPolicy=$($currentCounts.groupPolicy), updateRing=$($currentCounts.updateRing), script=$($currentCounts.script), enrollment=$($currentCounts.enrollment), autopilot=$($currentCounts.autopilot), appProtection=$($currentCounts.appProtection), ca=$($currentCounts.conditionalAccess))"
 
 $currentCoverage = if ($baselineMap.Count -gt 0) { [double]$currentMap.Count / [double]$baselineMap.Count } else { 1.0 }
 $isSuspiciousDrop = $baselineMap.Count -ge 50 -and $currentCoverage -lt 0.6
