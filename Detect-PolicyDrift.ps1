@@ -12,7 +12,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 
-$ScriptVersion = '3.4'
+$ScriptVersion = '3.5'
 $StorageApiVersion = '2023-11-03'
 $NowUtc = (Get-Date).ToUniversalTime()
 $TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
@@ -709,13 +709,20 @@ function Get-BlobNamesByPrefix {
     $url = "https://$StorageAccountName.blob.core.windows.net/$ContainerName`?$query"
     $response = Invoke-RestMethod -Method Get -Uri $url -Headers $headers -ErrorAction Stop
 
-    if ($response.EnumerationResults.Blobs -and $response.EnumerationResults.Blobs.Blob) {
-      foreach ($blob in @($response.EnumerationResults.Blobs.Blob)) {
+    $resultRoot = $response
+    if ($response -is [System.Xml.XmlDocument] -and $response.EnumerationResults) {
+      $resultRoot = $response.EnumerationResults
+    } elseif ($response.PSObject.Properties.Name -contains 'EnumerationResults' -and $response.EnumerationResults) {
+      $resultRoot = $response.EnumerationResults
+    }
+
+    if ($resultRoot.Blobs -and $resultRoot.Blobs.Blob) {
+      foreach ($blob in @($resultRoot.Blobs.Blob)) {
         [void]$names.Add([string]$blob.Name)
       }
     }
 
-    $nextMarker = [string]$response.EnumerationResults.NextMarker
+    $nextMarker = [string]$resultRoot.NextMarker
     if ([string]::IsNullOrWhiteSpace($nextMarker)) {
       break
     }
