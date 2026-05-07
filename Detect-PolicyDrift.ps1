@@ -74,6 +74,34 @@ function Get-HttpStatusCode {
   return $null
 }
 
+function Convert-TokenToPlainText {
+  param(
+    [Parameter(Mandatory = $true)] $TokenValue
+  )
+
+  if ($null -eq $TokenValue) {
+    return ''
+  }
+
+  if ($TokenValue -is [string]) {
+    return [string]$TokenValue
+  }
+
+  if ($TokenValue -is [System.Security.SecureString]) {
+    $ptr = [System.IntPtr]::Zero
+    try {
+      $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($TokenValue)
+      return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+    } finally {
+      if ($ptr -ne [System.IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+      }
+    }
+  }
+
+  return [string]$TokenValue
+}
+
 function Get-ManagedIdentityToken {
   param(
     [Parameter(Mandatory = $true)] [string]$ResourceUrl
@@ -86,14 +114,14 @@ function Get-ManagedIdentityToken {
   try {
     $tokenResult = Get-AzAccessToken -ResourceUrl $ResourceUrl -TenantId $TenantId
     if ($tokenResult -and $tokenResult.Token) {
-      $token = [string]$tokenResult.Token
+      $token = Convert-TokenToPlainText -TokenValue $tokenResult.Token
     }
   } catch {
     Write-RunbookLog -Level 'WARN' -Message "Get-AzAccessToken with -TenantId failed for '$ResourceUrl'. Retrying without tenant."
     try {
       $tokenResult = Get-AzAccessToken -ResourceUrl $ResourceUrl
       if ($tokenResult -and $tokenResult.Token) {
-        $token = [string]$tokenResult.Token
+        $token = Convert-TokenToPlainText -TokenValue $tokenResult.Token
       }
     } catch {
       Write-ExceptionDetails -Exception $_.Exception -Context "Unable to acquire token for '$ResourceUrl'."
