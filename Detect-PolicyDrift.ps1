@@ -12,7 +12,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 
-$ScriptVersion = '3.7'
+$ScriptVersion = '3.8'
 $StorageApiVersion = '2023-11-03'
 $NowUtc = (Get-Date).ToUniversalTime()
 $TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
@@ -716,13 +716,21 @@ function Get-BlobNamesByPrefix {
       $resultRoot = $response.EnumerationResults
     }
 
-    if ($resultRoot.Blobs -and $resultRoot.Blobs.Blob) {
-      foreach ($blob in @($resultRoot.Blobs.Blob)) {
+    $blobsNode = $null
+    if ($resultRoot -and ($resultRoot.PSObject.Properties.Name -contains 'Blobs')) {
+      $blobsNode = $resultRoot.Blobs
+    }
+
+    if ($blobsNode -and ($blobsNode.PSObject.Properties.Name -contains 'Blob') -and $blobsNode.Blob) {
+      foreach ($blob in @($blobsNode.Blob)) {
         [void]$names.Add([string]$blob.Name)
       }
     }
 
-    $nextMarker = [string]$resultRoot.NextMarker
+    $nextMarker = ''
+    if ($resultRoot -and ($resultRoot.PSObject.Properties.Name -contains 'NextMarker')) {
+      $nextMarker = [string]$resultRoot.NextMarker
+    }
     if ([string]::IsNullOrWhiteSpace($nextMarker)) {
       break
     }
@@ -838,6 +846,25 @@ function Compare-And-WriteChanges {
 
   $changesWritten = 0
   $currentKeys = [System.Collections.Generic.HashSet[string]]::new()
+  $baselineMap = @{}
+
+  $baselineBlobNames = Get-BlobNamesByPrefix -Prefix "$BaselinePrefix/" -StorageToken $StorageToken
+  foreach ($baselineBlob in $baselineBlobNames) {
+    if ($baselineBlob -like '*/_baseline.complete.json') { continue }
+    if ($baselineBlob -notlike '*.json') { continue }
+
+    $relative = $baselineBlob.Substring(("$BaselinePrefix/").Length)
+    $slash = $relative.IndexOf('/')
+    if ($slash -lt 1) { continue }
+
+    $type = $relative.Substring(0, $slash)
+    $fileName = $relative.Substring($slash + 1)
+    if (-not $fileName.EndsWith('.json')) { continue }
+
+    $id = $fileName.Substring(0, $fileName.Length - 5)
+    $key = Build-PolicyKey -PolicyType $type -PolicyId $id
+    $baselineMap[$key] = $baselineBlob
+  }
 
   foreach ($policy in $TempPolicies) {
     $type = [string]$policy.policyType
@@ -847,13 +874,10 @@ function Compare-And-WriteChanges {
     $key = Build-PolicyKey -PolicyType $type -PolicyId $id
     [void]$currentKeys.Add($key)
 
-    $baselinePath = "$BaselinePrefix/$type/$id.json"
     $changePath = "$ChangesPrefix/$TimestampFolder/$type/$id.json"
-
-    $baselineExists = Test-BlobExists -BlobPath $baselinePath -StorageToken $StorageToken
     $currentJson = Get-NormalizedJson -Object $policy.content
 
-    if (-not $baselineExists) {
+    if (-not $baselineMap.ContainsKey($key)) {
       $doc = [ordered]@{
         changeType = 'added'
         policyType = $type
@@ -869,6 +893,7 @@ function Compare-And-WriteChanges {
       continue
     }
 
+    $baselinePath = [string]$baselineMap[$key]
     $baselineContent = Read-JsonBlob -BlobPath $baselinePath -StorageToken $StorageToken
     $baselineJson = Get-NormalizedJson -Object $baselineContent
 
@@ -886,14 +911,15 @@ function Compare-And-WriteChanges {
       [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
       $changesWritten++
     }
+
+    [void]$baselineMap.Remove($key)
   }
 
-  $baselineBlobNames = Get-BlobNamesByPrefix -Prefix "$BaselinePrefix/" -StorageToken $StorageToken
-  foreach ($baselineBlob in $baselineBlobNames) {
-    if ($baselineBlob -like '*/_baseline.complete.json') { continue }
-    if ($baselineBlob -notlike '*.json') { continue }
-
-    $relative = $baselineBlob.Substring(("$BaselinePrefix/").Length)
+  foreach ($baselineBlob in $baselineMap.Values) {
+    $relative = [string]$baselineBlob
+    if ($relative.StartsWith("$BaselinePrefix/")) {
+      $relative = $relative.Substring(("$BaselinePrefix/").Length)
+    }
     $slash = $relative.IndexOf('/')
     if ($slash -lt 1) { continue }
 
