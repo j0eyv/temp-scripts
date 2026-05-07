@@ -11,7 +11,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.0'
+$ScriptVersion = '3.1'
 $StorageApiVersion = '2023-11-03'
 $NowUtc = (Get-Date).ToUniversalTime()
 $TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
@@ -134,6 +134,29 @@ function Get-ManagedIdentityToken {
   }
 
   return $token
+}
+
+function Normalize-TokenInput {
+  param(
+    [Parameter(Mandatory = $true)] $TokenInput,
+    [Parameter(Mandatory = $false)] [string]$TokenName = 'token'
+  )
+
+  $value = $TokenInput
+  if ($value -is [System.Array]) {
+    if ($value.Count -gt 0) {
+      $value = $value[$value.Count - 1]
+    } else {
+      $value = ''
+    }
+  }
+
+  $normalized = Convert-TokenToPlainText -TokenValue $value
+  if ([string]::IsNullOrWhiteSpace($normalized)) {
+    throw "Normalized $TokenName is empty."
+  }
+
+  return $normalized
 }
 
 function Invoke-GraphRequest {
@@ -875,8 +898,10 @@ try {
   Disable-AzContextAutosave -Scope Process | Out-Null
   Connect-AzAccount -Identity -Tenant $TenantId | Out-Null
 
-  $graphToken = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com/'
-  $storageToken = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com/'
+  $graphTokenRaw = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com/'
+  $storageTokenRaw = Get-ManagedIdentityToken -ResourceUrl 'https://storage.azure.com/'
+  $graphToken = Normalize-TokenInput -TokenInput $graphTokenRaw -TokenName 'graph token'
+  $storageToken = Normalize-TokenInput -TokenInput $storageTokenRaw -TokenName 'storage token'
 
   Write-RunbookLog -Level 'INFO' -Message 'Collecting full Intune policy backup from Microsoft Graph...'
   $policies = Get-AllIntunePolicies -Token $graphToken
