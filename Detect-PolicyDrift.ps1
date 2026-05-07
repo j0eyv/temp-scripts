@@ -23,7 +23,7 @@ function Write-RunbookLog {
   )
 
   $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
-  Write-Output "[$ts][$Level] $Message"
+  Write-Host "[$ts][$Level] $Message"
 }
 
 function Write-ExceptionDetails {
@@ -36,14 +36,14 @@ function Write-ExceptionDetails {
     Write-RunbookLog -Level 'ERROR' -Message $Context
   }
 
-  Write-Output "[EXCEPTION] Type      : $($Exception.GetType().FullName)"
-  Write-Output "[EXCEPTION] Message   : $($Exception.Message)"
+  Write-Host "[EXCEPTION] Type      : $($Exception.GetType().FullName)"
+  Write-Host "[EXCEPTION] Message   : $($Exception.Message)"
 
   if ($Exception.PSObject.Properties.Name -contains 'InvocationInfo' -and $Exception.InvocationInfo) {
-    Write-Output "[EXCEPTION] Command   : $($Exception.InvocationInfo.MyCommand)"
-    Write-Output "[EXCEPTION] Line      : $($Exception.InvocationInfo.ScriptLineNumber)"
-    Write-Output "[EXCEPTION] Position  : $($Exception.InvocationInfo.OffsetInLine)"
-    Write-Output "[EXCEPTION] LineText  : $($Exception.InvocationInfo.Line)"
+    Write-Host "[EXCEPTION] Command   : $($Exception.InvocationInfo.MyCommand)"
+    Write-Host "[EXCEPTION] Line      : $($Exception.InvocationInfo.ScriptLineNumber)"
+    Write-Host "[EXCEPTION] Position  : $($Exception.InvocationInfo.OffsetInLine)"
+    Write-Host "[EXCEPTION] LineText  : $($Exception.InvocationInfo.Line)"
   }
 }
 
