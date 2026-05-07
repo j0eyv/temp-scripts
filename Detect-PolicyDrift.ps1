@@ -802,27 +802,67 @@ function Remove-BlobsByPrefix {
   return $removed
 }
 
+function Test-IsVolatileProperty {
+  param(
+    [Parameter(Mandatory = $true)] [string]$PropertyName
+  )
+
+  $volatileProps = @(
+    '@odata.context',
+    '@odata.etag',
+    '@odata.nextLink',
+    'createdDateTime',
+    'creationDateTime',
+    'lastModifiedDateTime',
+    'modifiedDateTime',
+    'lastSyncDateTime'
+  )
+
+  return ($volatileProps -contains $PropertyName)
+}
+
 function ConvertTo-NormalizedObject {
   param([Parameter(Mandatory = $true)][AllowNull()] $InputObject)
 
   if ($null -eq $InputObject) { return $null }
 
+  # Hashtable / ordered dictionary path
   if ($InputObject -is [System.Collections.IDictionary]) {
     $ordered = [ordered]@{}
     foreach ($key in ($InputObject.Keys | Sort-Object)) {
-      $ordered[[string]$key] = ConvertTo-NormalizedObject -InputObject $InputObject[$key]
+      $stringKey = [string]$key
+      if (Test-IsVolatileProperty -PropertyName $stringKey) { continue }
+      $ordered[$stringKey] = ConvertTo-NormalizedObject -InputObject $InputObject[$key]
+    }
+
+    return $ordered
+  }
+
+  # PSCustomObject path — Invoke-RestMethod returns these when deserializing JSON blobs
+  if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+    $ordered = [ordered]@{}
+    foreach ($prop in ($InputObject.PSObject.Properties | Sort-Object Name)) {
+      if (Test-IsVolatileProperty -PropertyName $prop.Name) { continue }
+      $ordered[$prop.Name] = ConvertTo-NormalizedObject -InputObject $prop.Value
     }
 
     return $ordered
   }
 
   if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
-    $arr = @()
+    $normalizedItems = @()
     foreach ($x in $InputObject) {
-      $arr += ,(ConvertTo-NormalizedObject -InputObject $x)
+      $normalizedItems += ,(ConvertTo-NormalizedObject -InputObject $x)
     }
 
-    return $arr
+    # Graph can return arrays in unstable order; sort by serialized value to avoid false drift.
+    return @($normalizedItems | Sort-Object {
+      if ($null -eq $_) {
+        'null'
+      } else {
+        ($_ | ConvertTo-Json -Depth 100 -Compress)
+      }
+    })
   }
 
   return $InputObject
@@ -877,7 +917,14 @@ function Compare-And-WriteChanges {
     [Parameter(Mandatory = $true)] [string]$TimestampFolder
   )
 
-  $changesWritten = 0
+  $stats = [ordered]@{
+    added = 0
+    modified = 0
+    removed = 0
+    unchanged = 0
+    totalChanges = 0
+  }
+
   $currentRelativeSet = [System.Collections.Generic.HashSet[string]]::new()
   $baselineRelativeMap = @{}
 
@@ -922,7 +969,8 @@ function Compare-And-WriteChanges {
       }
 
       [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
-      $changesWritten++
+      $stats.added++
+      $stats.totalChanges++
       continue
     }
 
@@ -942,7 +990,10 @@ function Compare-And-WriteChanges {
       }
 
       [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
-      $changesWritten++
+      $stats.modified++
+      $stats.totalChanges++
+    } else {
+      $stats.unchanged++
     }
 
     [void]$baselineRelativeMap.Remove($relative)
@@ -956,12 +1007,12 @@ function Compare-And-WriteChanges {
     $fileName = $relative.Substring($slash + 1)
     if (-not $fileName.EndsWith('.json')) { continue }
 
-  $id = $fileName.Substring(0, $fileName.Length - 5)
-  if ($currentRelativeSet.Contains($relative)) { continue }
+    $id = $fileName.Substring(0, $fileName.Length - 5)
+    if ($currentRelativeSet.Contains($relative)) { continue }
 
-  $baselineBlob = [string]$baselineRelativeMap[$relative]
+    $baselineBlob = [string]$baselineRelativeMap[$relative]
     $baselineContent = Read-JsonBlob -BlobPath $baselineBlob -StorageToken $StorageToken
-  $changePath = "$ChangesPrefix/$TimestampFolder/$relative"
+    $changePath = "$ChangesPrefix/$TimestampFolder/$relative"
 
     $doc = [ordered]@{
       changeType = 'removed'
@@ -974,10 +1025,12 @@ function Compare-And-WriteChanges {
     }
 
     [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
-    $changesWritten++
+    $stats.removed++
+    $stats.totalChanges++
   }
 
-  return $changesWritten
+  Write-RunbookLog -Level 'INFO' -Message "Drift stats: added=$($stats.added) modified=$($stats.modified) removed=$($stats.removed) unchanged=$($stats.unchanged) totalChanges=$($stats.totalChanges)"
+  return $stats
 }
 
 try {
@@ -1037,7 +1090,7 @@ try {
   [void](Write-JsonBlob -BlobPath "$tempRoot/_manifest.json" -Data $tempManifest -StorageToken $storageToken)
   Write-RunbookLog -Level 'INFO' -Message "Temp snapshot written: '$tempRoot' with $tempSaved policy JSON file(s)."
 
-  $changesWritten = Compare-And-WriteChanges -TempRoot $tempRoot -BaselinePrefix $BaselinePrefix -ChangesPrefix $ChangesPrefix -StorageToken $storageToken -TimestampFolder $TimestampFolder
+  $changeStats = Compare-And-WriteChanges -TempRoot $tempRoot -BaselinePrefix $BaselinePrefix -ChangesPrefix $ChangesPrefix -StorageToken $storageToken -TimestampFolder $TimestampFolder
 
   $changesSummary = [ordered]@{
     generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
@@ -1046,11 +1099,15 @@ try {
     tempRoot = $tempRoot
     changesRoot = "$ChangesPrefix/$TimestampFolder"
     totalPoliciesEvaluated = @($policies).Count
-    changedPolicies = $changesWritten
+    changedPolicies = [int]$changeStats.totalChanges
+    addedPolicies = [int]$changeStats.added
+    modifiedPolicies = [int]$changeStats.modified
+    removedPolicies = [int]$changeStats.removed
+    unchangedPolicies = [int]$changeStats.unchanged
   }
 
   [void](Write-JsonBlob -BlobPath "$ChangesPrefix/$TimestampFolder/_summary.json" -Data $changesSummary -StorageToken $storageToken)
-  Write-RunbookLog -Level 'INFO' -Message "Changes written: $changesWritten file(s) under '$ChangesPrefix/$TimestampFolder/'."
+  Write-RunbookLog -Level 'INFO' -Message "Changes written: $([int]$changeStats.totalChanges) file(s) under '$ChangesPrefix/$TimestampFolder/'."
 
   try {
     $removedTemp = Remove-BlobsByPrefix -Prefix "$tempRoot/" -StorageToken $storageToken
