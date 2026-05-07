@@ -72,7 +72,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$ScriptVersion = '2.12-debug'
+$ScriptVersion = '2.13-content'
 $VerbosePreference = 'Continue'
 
 function Write-RunbookLog {
@@ -407,6 +407,238 @@ function Invoke-GraphPagedGet {
   return , $items.ToArray()
 }
 
+function Get-HttpStatusCode {
+  param(
+    [Parameter(Mandatory = $true)] $ErrorRecord
+  )
+
+  try {
+    return [int]$ErrorRecord.Exception.Response.StatusCode
+  } catch {
+    return $null
+  }
+}
+
+function Invoke-GraphGet {
+  <#
+  .SYNOPSIS Executes a single Graph GET request with token-refresh and
+            throttling retry behavior.
+  #>
+  param(
+    [Parameter(Mandatory = $true)] [string]$Path,
+    [Parameter(Mandatory = $true)] $Token,
+    [int]$MaxRetries = 5
+  )
+
+  $tokenString = ConvertTo-TokenString -TokenValue $Token
+  $url = "$GraphBaseUrl$Path"
+  $retryCount = 0
+
+  while ($retryCount -lt $MaxRetries) {
+    try {
+      return Invoke-RestMethod -Method GET -Uri $url -Headers @{
+        Authorization   = "Bearer $tokenString"
+        ConsistencyLevel = 'eventual'
+      }
+    } catch {
+      if (Is-ExpiredTokenError -ErrorRecord $_) {
+        Write-RunbookLog -Level 'WARN' -Message "Graph token expired for '$Path'; refreshing and retrying."
+        $tokenString = Get-ManagedIdentityToken -ResourceUrl 'https://graph.microsoft.com'
+        continue
+      }
+
+      if (Is-ThrottlingError -ErrorRecord $_) {
+        $retryCount++
+        if ($retryCount -ge $MaxRetries) {
+          Write-RunbookLog -Level 'ERROR' -Message "Graph GET throttled for '$Path'. Max retries ($MaxRetries) exceeded."
+          throw
+        }
+
+        $waitSeconds = Get-RetryAfterSeconds -ErrorRecord $_ -DefaultSeconds ([Math]::Pow(2, $retryCount - 1))
+        Write-RunbookLog -Level 'WARN' -Message "Graph GET throttled for '$Path'. Retry $retryCount/$MaxRetries after $waitSeconds seconds."
+        Start-Sleep -Seconds $waitSeconds
+        continue
+      }
+
+      throw
+    }
+  }
+
+  throw "Graph GET failed after $MaxRetries retries for '$Path'."
+}
+
+function Get-CaseInsensitiveValue {
+  param(
+    [Parameter(Mandatory = $true)] $Object,
+    [Parameter(Mandatory = $true)] [string]$Name
+  )
+
+  if ($null -eq $Object) { return $null }
+
+  if ($Object -is [System.Collections.IDictionary]) {
+    foreach ($key in $Object.Keys) {
+      if ([string]$key -ieq $Name) {
+        return $Object[$key]
+      }
+    }
+    return $null
+  }
+
+  $prop = $Object.PSObject.Properties[$Name]
+  if ($prop) {
+    return $prop.Value
+  }
+
+  foreach ($p in $Object.PSObject.Properties) {
+    if ([string]$p.Name -ieq $Name) {
+      return $p.Value
+    }
+  }
+
+  return $null
+}
+
+function Get-IntunePolicyId {
+  param(
+    [Parameter(Mandatory = $true)] $PolicyObject
+  )
+
+  return [string](Get-CaseInsensitiveValue -Object $PolicyObject -Name 'id')
+}
+
+function Try-Invoke-GraphPagedGet {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Path,
+    [Parameter(Mandatory = $true)] $Token
+  )
+
+  try {
+    return Invoke-GraphPagedGet -Path $Path -Token $Token
+  } catch {
+    $statusCode = Get-HttpStatusCode -ErrorRecord $_
+    if ($statusCode -eq 404) {
+      return @()
+    }
+
+    throw
+  }
+}
+
+function Get-IntunePolicyContent {
+  <#
+  .SYNOPSIS Resolves one Intune policy into a content-rich object with settings,
+            assignments, and additional detail collections when available.
+  #>
+  param(
+    [Parameter(Mandatory = $true)] [ValidateSet('configuration', 'device', 'security', 'compliance')] [string]$PolicyType,
+    [Parameter(Mandatory = $true)] $PolicyObject,
+    [Parameter(Mandatory = $true)] $Token
+  )
+
+  $policyId = Get-IntunePolicyId -PolicyObject $PolicyObject
+  if ([string]::IsNullOrWhiteSpace($policyId)) {
+    return $PolicyObject
+  }
+
+  switch ($PolicyType) {
+    'configuration' {
+      $detailPath      = "/beta/deviceManagement/configurationPolicies/$policyId"
+      $settingsPath    = "/beta/deviceManagement/configurationPolicies/$policyId/settings?$top=1000"
+      $assignmentsPath = "/beta/deviceManagement/configurationPolicies/$policyId/assignments?$top=1000"
+    }
+    'device' {
+      $detailPath      = "/beta/deviceManagement/deviceConfigurations/$policyId"
+      $settingsPath    = ''
+      $assignmentsPath = "/beta/deviceManagement/deviceConfigurations/$policyId/assignments?$top=1000"
+    }
+    'security' {
+      $detailPath      = "/beta/deviceManagement/intents/$policyId"
+      $settingsPath    = "/beta/deviceManagement/intents/$policyId/settings?$top=1000"
+      $assignmentsPath = "/beta/deviceManagement/intents/$policyId/assignments?$top=1000"
+    }
+    'compliance' {
+      $detailPath      = "/beta/deviceManagement/deviceCompliancePolicies/$policyId"
+      $settingsPath    = ''
+      $assignmentsPath = "/beta/deviceManagement/deviceCompliancePolicies/$policyId/assignments?$top=1000"
+      $actionsPath     = "/beta/deviceManagement/deviceCompliancePolicies/$policyId/scheduledActionsForRule?$top=1000"
+    }
+  }
+
+  $detail = $null
+  try {
+    $detail = Invoke-GraphGet -Path $detailPath -Token $Token
+  } catch {
+    Write-RunbookLog -Level 'WARN' -Message "Failed to resolve detailed policy payload for $PolicyType policy '$policyId'. Falling back to list object."
+    $detail = $PolicyObject
+  }
+
+  $assignments = @()
+  if (-not [string]::IsNullOrWhiteSpace($assignmentsPath)) {
+    try {
+      $assignments = Try-Invoke-GraphPagedGet -Path $assignmentsPath -Token $Token
+    } catch {
+      Write-RunbookLog -Level 'WARN' -Message "Failed to load assignments for $PolicyType policy '$policyId'."
+      $assignments = @()
+    }
+  }
+
+  $settings = @()
+  if (-not [string]::IsNullOrWhiteSpace($settingsPath)) {
+    try {
+      $settings = Try-Invoke-GraphPagedGet -Path $settingsPath -Token $Token
+    } catch {
+      Write-RunbookLog -Level 'WARN' -Message "Failed to load settings for $PolicyType policy '$policyId'."
+      $settings = @()
+    }
+  }
+
+  $scheduledActionsForRule = @()
+  if ($PolicyType -eq 'compliance' -and -not [string]::IsNullOrWhiteSpace($actionsPath)) {
+    try {
+      $scheduledActionsForRule = Try-Invoke-GraphPagedGet -Path $actionsPath -Token $Token
+    } catch {
+      Write-RunbookLog -Level 'WARN' -Message "Failed to load scheduled actions for compliance policy '$policyId'."
+      $scheduledActionsForRule = @()
+    }
+  }
+
+  return [ordered]@{
+    policyContentVersion     = 'full-v1'
+    policyType               = $PolicyType
+    id                       = $policyId
+    detail                   = $detail
+    assignments              = $assignments
+    settings                 = $settings
+    scheduledActionsForRule  = $scheduledActionsForRule
+  }
+}
+
+function Resolve-IntunePolicyContentCollection {
+  <#
+  .SYNOPSIS Enriches each policy item with full content payload for drift hashing.
+  #>
+  param(
+    [Parameter(Mandatory = $true)] [ValidateSet('configuration', 'device', 'security', 'compliance')] [string]$PolicyType,
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [array]$Items,
+    [Parameter(Mandatory = $true)] $Token
+  )
+
+  $resolved = [System.Collections.Generic.List[object]]::new()
+  $total = $Items.Count
+  $index = 0
+
+  foreach ($item in $Items) {
+    $index++
+    if (($index % 25) -eq 0 -or $index -eq $total) {
+      Write-RunbookLog -Level 'DEBUG' -Message "Resolving $PolicyType policy content: $index/$total"
+    }
+
+    $resolved.Add((Get-IntunePolicyContent -PolicyType $PolicyType -PolicyObject $item -Token $Token))
+  }
+
+  return , $resolved.ToArray()
+}
+
 function Get-PolicyTypeCounts {
   <#
   .SYNOPSIS Returns a hashtable with policy counts by policyType from a policy map.
@@ -634,7 +866,7 @@ function Get-DriftEvents {
   foreach ($k in $Baseline.Keys) { [void]$allKeys.Add($k) }
   foreach ($k in $Current.Keys)  { [void]$allKeys.Add($k) }
 
-  $events = [System.Collections.Generic.List[pscustomobject]]::new()
+  $driftEvents = [System.Collections.Generic.List[pscustomobject]]::new()
 
   foreach ($k in $allKeys) {
     $prev = $Baseline[$k]
@@ -642,7 +874,7 @@ function Get-DriftEvents {
 
     # ── Added ────────────────────────────────────────────────────────────────
     if ($null -eq $prev -and $null -ne $cur) {
-      $events.Add([pscustomobject]@{
+      $driftEvents.Add([pscustomobject]@{
         policyKey    = $k
         policyId     = $cur.policyId
         policyType   = $cur.policyType
@@ -659,7 +891,7 @@ function Get-DriftEvents {
 
     # ── Removed ──────────────────────────────────────────────────────────────
     if ($null -ne $prev -and $null -eq $cur) {
-      $events.Add([pscustomobject]@{
+      $driftEvents.Add([pscustomobject]@{
         policyKey    = $k
         policyId     = $prev.policyId
         policyType   = $prev.policyType
@@ -690,7 +922,7 @@ function Get-DriftEvents {
       $changedFields.Add([string]$entry.field)
     }
 
-    $events.Add([pscustomobject]@{
+    $driftEvents.Add([pscustomobject]@{
       policyKey    = $k
       policyId     = $cur.policyId
       policyType   = $cur.policyType
@@ -704,7 +936,7 @@ function Get-DriftEvents {
     })
   }
 
-  return , $events.ToArray()
+  return , $driftEvents.ToArray()
 }
 
 function Add-LeafDiffs {
@@ -1061,6 +1293,22 @@ try {
   Write-RunbookLog -Level 'DEBUG' -Message 'Fetching security compliance policies...'
   $compliancePolicies = Invoke-GraphPagedGet -Path '/beta/deviceManagement/deviceCompliancePolicies?$top=999' -Token $graphToken
   Write-RunbookLog -Level 'DEBUG' -Message "Compliance policies returned: $($compliancePolicies.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving configuration policy content (detail/settings/assignments)...'
+  $configPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'configuration' -Items $configPolicies -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Configuration policy content objects resolved: $($configPoliciesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving device configuration content (detail/assignments)...'
+  $deviceConfigsFull = Resolve-IntunePolicyContentCollection -PolicyType 'device' -Items $deviceConfigs -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Device configuration content objects resolved: $($deviceConfigsFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving security intent content (detail/settings/assignments)...'
+  $securityPoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'security' -Items $securityPolicies -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Security intent content objects resolved: $($securityPoliciesFull.Count)"
+
+  Write-RunbookLog -Level 'DEBUG' -Message 'Resolving compliance policy content (detail/assignments/scheduled actions)...'
+  $compliancePoliciesFull = Resolve-IntunePolicyContentCollection -PolicyType 'compliance' -Items $compliancePolicies -Token $graphToken
+  Write-RunbookLog -Level 'DEBUG' -Message "Compliance policy content objects resolved: $($compliancePoliciesFull.Count)"
 } catch {
   $errMsg = "Graph query failed: $_"
   Write-RunbookLog -Level 'ERROR' -Message $errMsg
@@ -1082,10 +1330,10 @@ Write-RunbookLog -Message "  compliance policies   : $($compliancePolicies.Count
 
 # ── 3. Build normalised current-state map ────────────────────────────────────
 $currentMap = Merge-PolicyMaps -Maps @(
-  (Build-PolicyMap -PolicyType 'configuration' -Items $configPolicies),
-  (Build-PolicyMap -PolicyType 'device'        -Items $deviceConfigs),
-  (Build-PolicyMap -PolicyType 'security'      -Items $securityPolicies),
-  (Build-PolicyMap -PolicyType 'compliance'    -Items $compliancePolicies)
+  (Build-PolicyMap -PolicyType 'configuration' -Items $configPoliciesFull),
+  (Build-PolicyMap -PolicyType 'device'        -Items $deviceConfigsFull),
+  (Build-PolicyMap -PolicyType 'security'      -Items $securityPoliciesFull),
+  (Build-PolicyMap -PolicyType 'compliance'    -Items $compliancePoliciesFull)
 )
 
 $rawGraphTotal = $configPolicies.Count + $deviceConfigs.Count + $securityPolicies.Count + $compliancePolicies.Count
@@ -1110,6 +1358,7 @@ $currentSnapshot = [ordered]@{
   capturedAt   = $nowIso
   tenantId     = $TenantId
   policyCount  = $currentMap.Count
+  contentMode  = 'full-policy-with-settings'
   policies     = $currentMap
 }
 $currentSnapshotJson = $currentSnapshot | ConvertTo-Json -Depth 100
@@ -1117,6 +1366,20 @@ $currentSnapshotJson = $currentSnapshot | ConvertTo-Json -Depth 100
 # Write in-flight snapshot so it can be inspected if the run aborts mid-way
 $currentPath = "$TempPrefix/$stamp/current.json"
 Write-StorageBlob -Token $storageToken -BlobPath $currentPath -Text $currentSnapshotJson
+
+# Write a raw full-content export blob for diagnostics and manual review.
+$fullExportPath = "$TempPrefix/$stamp/full-policy-export.json"
+$fullExportDoc = [ordered]@{
+  capturedAt             = $nowIso
+  tenantId               = $TenantId
+  configurationPolicies  = $configPoliciesFull
+  deviceConfigurations   = $deviceConfigsFull
+  securityIntents        = $securityPoliciesFull
+  compliancePolicies     = $compliancePoliciesFull
+}
+Write-StorageBlob -Token $storageToken -BlobPath $fullExportPath `
+  -Text ($fullExportDoc | ConvertTo-Json -Depth 100)
+Write-RunbookLog -Message "Full policy content export written to '$fullExportPath'."
 
 # ── 4. Check for existing baseline ──────────────────────────────────────────
 $baselinePath = "$BaselinePrefix/current.json"
@@ -1191,10 +1454,10 @@ if ($isSuspiciousDrop) {
 }
 
 # ── 7. Compute drift ─────────────────────────────────────────────────────────
-$events = Get-DriftEvents -Baseline $baselineMap -Current $currentMap -Timestamp $nowIso
+$driftEvents = Get-DriftEvents -Baseline $baselineMap -Current $currentMap -Timestamp $nowIso
 
 # ── 8a. No drift — write heartbeat and exit ──────────────────────────────────
-if ($events.Count -eq 0) {
+if ($driftEvents.Count -eq 0) {
   Write-RunbookLog -Message 'No drift detected. Writing heartbeat.'
   Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
     -Note         'Baseline compare complete — no changes.' `
@@ -1204,27 +1467,27 @@ if ($events.Count -eq 0) {
 }
 
 # ── 8b. Drift detected — persist artifacts and table rows ────────────────────
-Write-RunbookLog -Message "Drift detected: $($events.Count) event(s). Persisting artifacts..."
+Write-RunbookLog -Message "Drift detected: $($driftEvents.Count) event(s). Persisting artifacts..."
 $changesRoot = "$ChangesPrefix/$stamp"
 
-foreach ($event in $events) {
-  $safeId      = ($event.policyId -replace '[^a-zA-Z0-9\-]', '_')
-  $changedBlob = "$changesRoot/$($event.policyType)/$safeId.json"
+foreach ($driftEvent in $driftEvents) {
+  $safeId      = ($driftEvent.policyId -replace '[^a-zA-Z0-9\-]', '_')
+  $changedBlob = "$changesRoot/$($driftEvent.policyType)/$safeId.json"
 
   # Blob payload: full current object for added/modified; tombstone for removed
-  if ($event.changeType -eq 'removed') {
+  if ($driftEvent.changeType -eq 'removed') {
     $blobBody = [ordered]@{
-      policyId      = $event.policyId
-      policyType    = $event.policyType
-      policyName    = $event.policyName
+      policyId      = $driftEvent.policyId
+      policyType    = $driftEvent.policyType
+      policyName    = $driftEvent.policyName
       changeType    = 'removed'
-      previousHash  = $event.previousHash
+      previousHash  = $driftEvent.previousHash
       currentHash   = ''
       changedFields = @()
-      modifiedAt    = $event.modifiedAt
+      modifiedAt    = $driftEvent.modifiedAt
     }
   } else {
-    $blobBody = $currentMap[$event.policyKey]
+    $blobBody = $currentMap[$driftEvent.policyKey]
   }
 
   Write-StorageBlob -Token $storageToken -BlobPath $changedBlob `
@@ -1234,44 +1497,44 @@ foreach ($event in $events) {
   # driftData serialises as a JSON array of {field, previousValue, currentValue}
   # matching the PolicyDriftItem interface consumed by the React app.
   $driftDataJson = Build-DriftDataJson `
-    -DriftItems $event.driftItems `
-    -FallbackPrevious $event.previousHash `
-    -FallbackCurrent $event.currentHash
+    -DriftItems $driftEvent.driftItems `
+    -FallbackPrevious $driftEvent.previousHash `
+    -FallbackCurrent $driftEvent.currentHash
 
   Write-TableEntity -Token $storageToken -TableName 'TenantPolicyDriftEvents' -Entity @{
     PartitionKey  = $TenantId
     RowKey        = [guid]::NewGuid().ToString()
-    policyId      = $event.policyId
-    policyType    = $event.policyType
-    policyName    = $event.policyName
+    policyId      = $driftEvent.policyId
+    policyType    = $driftEvent.policyType
+    policyName    = $driftEvent.policyName
     modifiedBy    = 'automation-account'
-    modifiedAt    = $event.modifiedAt
-    driftSummary  = "$($event.changeType.ToUpperInvariant()) [$($event.policyType)] — $($event.policyName)"
+    modifiedAt    = $driftEvent.modifiedAt
+    driftSummary  = ('{0} [{1}] - {2}' -f $driftEvent.changeType.ToUpperInvariant(), $driftEvent.policyType, $driftEvent.policyName)
     driftData     = $driftDataJson
     source        = 'system'
     timestamp     = $nowIso
   }
 
-  Write-RunbookLog -Message "  [$($event.changeType.ToUpper())] $($event.policyType):$($event.policyId) - $($event.policyName)"
+  Write-RunbookLog -Message "  [$($driftEvent.changeType.ToUpper())] $($driftEvent.policyType):$($driftEvent.policyId) - $($driftEvent.policyName)"
 }
 
 # Run index blob (human-readable summary of the run)
 $indexDoc = [ordered]@{
   runAt        = $nowIso
   tenantId     = $TenantId
-  changeCount  = $events.Count
+  changeCount  = $driftEvents.Count
   baselinePath = $baselinePath
   tempPath     = $currentPath
-  changes      = $events | Select-Object policyKey, policyId, policyType, policyName, changeType, modifiedAt, changedFields
+  changes      = $driftEvents | Select-Object policyKey, policyId, policyType, policyName, changeType, modifiedAt, changedFields
 }
 Write-StorageBlob -Token $storageToken -BlobPath "$changesRoot/index.json" `
   -Text ($indexDoc | ConvertTo-Json -Depth 10)
 
 # Audit trail summary row
 Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (New-AuditRow `
-  -Note         "Drift run complete. $($events.Count) event(s) stored under $changesRoot." `
-  -DriftSummary "$($events.Count) change(s) across $($currentMap.Count) policies" `
-  -DriftData    (@{ changesRoot = $changesRoot; changeCount = $events.Count } | ConvertTo-Json -Compress) `
+  -Note         "Drift run complete. $($driftEvents.Count) event(s) stored under $changesRoot." `
+  -DriftSummary "$($driftEvents.Count) change(s) across $($currentMap.Count) policies" `
+  -DriftData    (@{ changesRoot = $changesRoot; changeCount = $driftEvents.Count } | ConvertTo-Json -Compress) `
   -Timestamp    $nowIso)
 
 # ── 9. Roll the baseline forward ─────────────────────────────────────────────
@@ -1280,6 +1543,6 @@ Write-TableEntity -Token $storageToken -TableName 'TenantAuditTrail' -Entity (Ne
 Write-RunbookLog -Message 'Rolling baseline forward to current snapshot...'
 Write-StorageBlob -Token $storageToken -BlobPath $baselinePath -Text $currentSnapshotJson
 
-Write-RunbookLog -Message "=== Run complete. $($events.Count) drift event(s) recorded. ==="
+Write-RunbookLog -Message "=== Run complete. $($driftEvents.Count) drift event(s) recorded. ==="
 
 #endregion
