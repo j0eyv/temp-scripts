@@ -12,7 +12,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 
-$ScriptVersion = '3.3'
+$ScriptVersion = '3.4'
 $StorageApiVersion = '2023-11-03'
 $NowUtc = (Get-Date).ToUniversalTime()
 $TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
@@ -240,7 +240,7 @@ function Invoke-GraphGet {
 }
 
 function Get-ObjectId {
-  param([Parameter(Mandatory = $true)] $Object)
+  param([Parameter(Mandatory = $true)][AllowNull()] $Object)
 
   if ($null -eq $Object) { return '' }
 
@@ -257,7 +257,7 @@ function Get-ObjectId {
 }
 
 function Get-ObjectName {
-  param([Parameter(Mandatory = $true)] $Object)
+  param([Parameter(Mandatory = $true)][AllowNull()] $Object)
 
   if ($null -eq $Object) { return '' }
 
@@ -279,7 +279,7 @@ function Get-ObjectName {
 }
 
 function ConvertTo-Hashtable {
-  param([Parameter(Mandatory = $true)] $InputObject)
+  param([Parameter(Mandatory = $true)][AllowNull()] $InputObject)
 
   if ($null -eq $InputObject) {
     return @{}
@@ -727,7 +727,7 @@ function Get-BlobNamesByPrefix {
 }
 
 function ConvertTo-NormalizedObject {
-  param([Parameter(Mandatory = $true)] $InputObject)
+  param([Parameter(Mandatory = $true)][AllowNull()] $InputObject)
 
   if ($null -eq $InputObject) { return $null }
 
