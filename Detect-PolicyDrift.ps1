@@ -12,7 +12,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 
-$ScriptVersion = '3.2'
+$ScriptVersion = '3.3'
 $StorageApiVersion = '2023-11-03'
 $NowUtc = (Get-Date).ToUniversalTime()
 $TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
@@ -182,9 +182,9 @@ function Invoke-GraphRequest {
 
       $retryAfter = 0
       if ($_.Exception -and $_.Exception.Response -and $_.Exception.Response.Headers) {
-        $retryAfterHeader = $_.Exception.Response.Headers['Retry-After']
-        if ($retryAfterHeader) {
-          [void][int]::TryParse([string]$retryAfterHeader, [ref]$retryAfter)
+        $retryAfterValues = $null
+        if ($_.Exception.Response.Headers.TryGetValues('Retry-After', [ref]$retryAfterValues)) {
+          [void][int]::TryParse(($retryAfterValues | Select-Object -First 1), [ref]$retryAfter)
         }
       }
 
