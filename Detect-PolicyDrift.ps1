@@ -1,18 +1,18 @@
 param(
   [Parameter(Mandatory = $true)] [string]$TenantId,
   [Parameter(Mandatory = $true)] [string]$StorageAccountName,
-  [Parameter(Mandatory = $false)] [string]$ContainerName = 'policy-drift',
-  [Parameter(Mandatory = $false)] [string]$GraphBaseUrl = 'https://graph.microsoft.com',
-  [Parameter(Mandatory = $false)] [string]$BaselinePrefix = 'baseline',
-  [Parameter(Mandatory = $false)] [string]$ChangesPrefix = 'changes',
-  [Parameter(Mandatory = $false)] [string]$TempPrefix = 'temp'
+  [string]$ContainerName = 'policy-drift',
+  [string]$GraphBaseUrl = 'https://graph.microsoft.com',
+  [string]$BaselinePrefix = 'baseline',
+  [string]$ChangesPrefix = 'changes',
+  [string]$TempPrefix = 'temp'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 
-$ScriptVersion = '3.5'
+$ScriptVersion = '3.7'
 $StorageApiVersion = '2023-11-03'
 $NowUtc = (Get-Date).ToUniversalTime()
 $TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
@@ -733,6 +733,34 @@ function Get-BlobNamesByPrefix {
   return @($names)
 }
 
+function Remove-Blob {
+  param(
+    [Parameter(Mandatory = $true)] [string]$BlobPath,
+    [Parameter(Mandatory = $true)] [string]$StorageToken
+  )
+
+  $headers = Get-StorageHeaders -Token $StorageToken
+  $url = New-BlobUrl -BlobPath $BlobPath
+  Invoke-RestMethod -Method Delete -Uri $url -Headers $headers -ErrorAction Stop | Out-Null
+}
+
+function Remove-BlobsByPrefix {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Prefix,
+    [Parameter(Mandatory = $true)] [string]$StorageToken
+  )
+
+  $blobNames = Get-BlobNamesByPrefix -Prefix $Prefix -StorageToken $StorageToken
+  $removed = 0
+
+  foreach ($blobName in $blobNames) {
+    Remove-Blob -BlobPath $blobName -StorageToken $StorageToken
+    $removed++
+  }
+
+  return $removed
+}
+
 function ConvertTo-NormalizedObject {
   param([Parameter(Mandatory = $true)][AllowNull()] $InputObject)
 
@@ -911,6 +939,34 @@ try {
   $graphToken = Normalize-TokenInput -TokenInput $graphTokenRaw -TokenName 'graph token'
   $storageToken = Normalize-TokenInput -TokenInput $storageTokenRaw -TokenName 'storage token'
 
+  $baselineMarkerPath = "$BaselinePrefix/_baseline.complete.json"
+  $baselineExists = Test-BlobExists -BlobPath $baselineMarkerPath -StorageToken $storageToken
+
+  if (-not $baselineExists) {
+    Write-RunbookLog -Level 'INFO' -Message "Baseline marker not found. Creating one-time baseline under '$BaselinePrefix/' only."
+
+    Write-RunbookLog -Level 'INFO' -Message 'Collecting full Intune policy backup from Microsoft Graph for baseline...'
+    $policies = Get-AllIntunePolicies -Token $graphToken
+    Write-RunbookLog -Level 'INFO' -Message "Resolved total policy objects for baseline: $(@($policies).Count)"
+
+    $baselineSaved = Save-PoliciesToPrefix -Policies $policies -Prefix $BaselinePrefix -StorageToken $storageToken -SkipIfExists $true
+
+    $baselineDoc = [ordered]@{
+      createdAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+      scriptVersion = $ScriptVersion
+      totalPolicies = @($policies).Count
+      baselinePrefix = $BaselinePrefix
+      note = 'Baseline is write-once. Existing baseline policy files are not overwritten.'
+    }
+
+    [void](Write-JsonBlob -BlobPath $baselineMarkerPath -Data $baselineDoc -StorageToken $storageToken -SkipIfExists $true)
+    Write-RunbookLog -Level 'INFO' -Message "Baseline initialized. New baseline policy files written: $baselineSaved"
+    Write-RunbookLog -Level 'INFO' -Message 'Runbook completed successfully (baseline-only run).'
+    return
+  }
+
+  Write-RunbookLog -Level 'INFO' -Message "Baseline exists at '$BaselinePrefix/'. Running temp snapshot, diff, and cleanup flow."
+
   Write-RunbookLog -Level 'INFO' -Message 'Collecting full Intune policy backup from Microsoft Graph...'
   $policies = Get-AllIntunePolicies -Token $graphToken
   Write-RunbookLog -Level 'INFO' -Message "Resolved total policy objects: $(@($policies).Count)"
@@ -927,27 +983,6 @@ try {
   [void](Write-JsonBlob -BlobPath "$tempRoot/_manifest.json" -Data $tempManifest -StorageToken $storageToken)
   Write-RunbookLog -Level 'INFO' -Message "Temp snapshot written: '$tempRoot' with $tempSaved policy JSON file(s)."
 
-  $baselineMarkerPath = "$BaselinePrefix/_baseline.complete.json"
-  $baselineExists = Test-BlobExists -BlobPath $baselineMarkerPath -StorageToken $storageToken
-
-  if (-not $baselineExists) {
-    Write-RunbookLog -Level 'INFO' -Message "Baseline marker not found. Creating one-time baseline under '$BaselinePrefix/'."
-    $baselineSaved = Save-PoliciesToPrefix -Policies $policies -Prefix $BaselinePrefix -StorageToken $storageToken -SkipIfExists $true
-
-    $baselineDoc = [ordered]@{
-      createdAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-      scriptVersion = $ScriptVersion
-      totalPolicies = @($policies).Count
-      baselinePrefix = $BaselinePrefix
-      note = 'Baseline is write-once. Existing baseline policy files are not overwritten.'
-    }
-
-    [void](Write-JsonBlob -BlobPath $baselineMarkerPath -Data $baselineDoc -StorageToken $storageToken -SkipIfExists $true)
-    Write-RunbookLog -Level 'INFO' -Message "Baseline initialized. New baseline policy files written: $baselineSaved"
-  } else {
-    Write-RunbookLog -Level 'INFO' -Message "Baseline already exists at '$BaselinePrefix/'. Baseline files were not overwritten."
-  }
-
   $changesWritten = Compare-And-WriteChanges -TempPolicies $policies -BaselinePrefix $BaselinePrefix -ChangesPrefix $ChangesPrefix -StorageToken $storageToken -TimestampFolder $TimestampFolder
 
   $changesSummary = [ordered]@{
@@ -962,6 +997,15 @@ try {
 
   [void](Write-JsonBlob -BlobPath "$ChangesPrefix/$TimestampFolder/_summary.json" -Data $changesSummary -StorageToken $storageToken)
   Write-RunbookLog -Level 'INFO' -Message "Changes written: $changesWritten file(s) under '$ChangesPrefix/$TimestampFolder/'."
+
+  try {
+    $removedTemp = Remove-BlobsByPrefix -Prefix "$tempRoot/" -StorageToken $storageToken
+    Write-RunbookLog -Level 'INFO' -Message "Temp cleanup complete. Removed $removedTemp blob(s) from '$tempRoot/'."
+  } catch {
+    Write-RunbookLog -Level 'WARN' -Message "Temp cleanup failed for '$tempRoot/'."
+    Write-ExceptionDetails -Exception $_.Exception
+  }
+
   Write-RunbookLog -Level 'INFO' -Message 'Runbook completed successfully.'
 } catch {
   Write-RunbookLog -Level 'ERROR' -Message 'Unhandled terminating error in runbook.'
