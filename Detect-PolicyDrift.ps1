@@ -10,8 +10,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$InformationPreference = 'Continue'
 
-$ScriptVersion = '3.1'
+$ScriptVersion = '3.2'
 $StorageApiVersion = '2023-11-03'
 $NowUtc = (Get-Date).ToUniversalTime()
 $TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
@@ -23,7 +24,7 @@ function Write-RunbookLog {
   )
 
   $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
-  Write-Host "[$ts][$Level] $Message"
+  Write-Information "[$ts][$Level] $Message"
 }
 
 function Write-ExceptionDetails {
@@ -36,14 +37,14 @@ function Write-ExceptionDetails {
     Write-RunbookLog -Level 'ERROR' -Message $Context
   }
 
-  Write-Host "[EXCEPTION] Type      : $($Exception.GetType().FullName)"
-  Write-Host "[EXCEPTION] Message   : $($Exception.Message)"
+  Write-Information "[EXCEPTION] Type      : $($Exception.GetType().FullName)"
+  Write-Information "[EXCEPTION] Message   : $($Exception.Message)"
 
   if ($Exception.PSObject.Properties.Name -contains 'InvocationInfo' -and $Exception.InvocationInfo) {
-    Write-Host "[EXCEPTION] Command   : $($Exception.InvocationInfo.MyCommand)"
-    Write-Host "[EXCEPTION] Line      : $($Exception.InvocationInfo.ScriptLineNumber)"
-    Write-Host "[EXCEPTION] Position  : $($Exception.InvocationInfo.OffsetInLine)"
-    Write-Host "[EXCEPTION] LineText  : $($Exception.InvocationInfo.Line)"
+    Write-Information "[EXCEPTION] Command   : $($Exception.InvocationInfo.MyCommand)"
+    Write-Information "[EXCEPTION] Line      : $($Exception.InvocationInfo.ScriptLineNumber)"
+    Write-Information "[EXCEPTION] Position  : $($Exception.InvocationInfo.OffsetInLine)"
+    Write-Information "[EXCEPTION] LineText  : $($Exception.InvocationInfo.Line)"
   }
 }
 
