@@ -12,7 +12,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 
-$ScriptVersion = '3.8'
+$ScriptVersion = '3.9'
 $StorageApiVersion = '2023-11-03'
 $NowUtc = (Get-Date).ToUniversalTime()
 $TimestampFolder = $NowUtc.ToString('yyyyMMdd-HHmmss')
@@ -690,6 +690,48 @@ function Read-JsonBlob {
   return Invoke-RestMethod -Method Get -Uri $url -Headers $headers -ErrorAction Stop
 }
 
+function ConvertTo-XmlDocument {
+  param(
+    [Parameter(Mandatory = $true)] [AllowNull()] [string]$XmlText,
+    [Parameter(Mandatory = $false)] [string]$Context = 'XML'
+  )
+
+  if ([string]::IsNullOrWhiteSpace($XmlText)) {
+    throw "$Context content is empty."
+  }
+
+  $clean = [string]$XmlText
+
+  # Remove UTF-8 BOM and common mojibake BOM sequence if present.
+  $clean = $clean.TrimStart([char]0xFEFF)
+  if ($clean.StartsWith([string][char]0x00EF + [char]0x00BB + [char]0x00BF)) {
+    $clean = $clean.Substring(3)
+  }
+  if ($clean.StartsWith('ï»¿')) {
+    $clean = $clean.Substring(3)
+  }
+
+  # Discard any leading non-XML bytes before the first '<'.
+  $firstLt = $clean.IndexOf('<')
+  if ($firstLt -gt 0) {
+    $clean = $clean.Substring($firstLt)
+  }
+
+  $xmlDoc = New-Object System.Xml.XmlDocument
+  $xmlDoc.PreserveWhitespace = $false
+
+  try {
+    $xmlDoc.LoadXml($clean)
+  } catch {
+    $previewLen = [math]::Min(240, $clean.Length)
+    $preview = if ($previewLen -gt 0) { $clean.Substring(0, $previewLen) } else { '' }
+    Write-RunbookLog -Level 'ERROR' -Message "$Context parsing failed. First bytes preview: $preview"
+    throw
+  }
+
+  return $xmlDoc
+}
+
 function Get-BlobNamesByPrefix {
   param(
     [Parameter(Mandatory = $true)] [string]$Prefix,
@@ -707,29 +749,20 @@ function Get-BlobNamesByPrefix {
     }
 
     $url = "https://$StorageAccountName.blob.core.windows.net/$ContainerName`?$query"
-    $response = Invoke-RestMethod -Method Get -Uri $url -Headers $headers -ErrorAction Stop
+    $response = Invoke-WebRequest -Method Get -Uri $url -Headers $headers -UseBasicParsing -ErrorAction Stop
+    $xml = ConvertTo-XmlDocument -XmlText ([string]$response.Content) -Context "Blob list response for prefix '$Prefix'"
 
-    $resultRoot = $response
-    if ($response -is [System.Xml.XmlDocument] -and $response.EnumerationResults) {
-      $resultRoot = $response.EnumerationResults
-    } elseif ($response.PSObject.Properties.Name -contains 'EnumerationResults' -and $response.EnumerationResults) {
-      $resultRoot = $response.EnumerationResults
-    }
-
-    $blobsNode = $null
-    if ($resultRoot -and ($resultRoot.PSObject.Properties.Name -contains 'Blobs')) {
-      $blobsNode = $resultRoot.Blobs
-    }
-
-    if ($blobsNode -and ($blobsNode.PSObject.Properties.Name -contains 'Blob') -and $blobsNode.Blob) {
-      foreach ($blob in @($blobsNode.Blob)) {
-        [void]$names.Add([string]$blob.Name)
+    $blobNodes = $xml.SelectNodes("//*[local-name()='Blob']/*[local-name()='Name']")
+    foreach ($nameNode in @($blobNodes)) {
+      if ($nameNode -and -not [string]::IsNullOrWhiteSpace([string]$nameNode.InnerText)) {
+        [void]$names.Add([string]$nameNode.InnerText)
       }
     }
 
+    $nextMarkerNode = $xml.SelectSingleNode("//*[local-name()='NextMarker']")
     $nextMarker = ''
-    if ($resultRoot -and ($resultRoot.PSObject.Properties.Name -contains 'NextMarker')) {
-      $nextMarker = [string]$resultRoot.NextMarker
+    if ($nextMarkerNode -and -not [string]::IsNullOrWhiteSpace([string]$nextMarkerNode.InnerText)) {
+      $nextMarker = [string]$nextMarkerNode.InnerText
     }
     if ([string]::IsNullOrWhiteSpace($nextMarker)) {
       break
@@ -837,7 +870,7 @@ function Save-PoliciesToPrefix {
 
 function Compare-And-WriteChanges {
   param(
-    [Parameter(Mandatory = $true)] [array]$TempPolicies,
+    [Parameter(Mandatory = $true)] [string]$TempRoot,
     [Parameter(Mandatory = $true)] [string]$BaselinePrefix,
     [Parameter(Mandatory = $true)] [string]$ChangesPrefix,
     [Parameter(Mandatory = $true)] [string]$StorageToken,
@@ -845,8 +878,8 @@ function Compare-And-WriteChanges {
   )
 
   $changesWritten = 0
-  $currentKeys = [System.Collections.Generic.HashSet[string]]::new()
-  $baselineMap = @{}
+  $currentRelativeSet = [System.Collections.Generic.HashSet[string]]::new()
+  $baselineRelativeMap = @{}
 
   $baselineBlobNames = Get-BlobNamesByPrefix -Prefix "$BaselinePrefix/" -StorageToken $StorageToken
   foreach ($baselineBlob in $baselineBlobNames) {
@@ -854,30 +887,30 @@ function Compare-And-WriteChanges {
     if ($baselineBlob -notlike '*.json') { continue }
 
     $relative = $baselineBlob.Substring(("$BaselinePrefix/").Length)
+    $baselineRelativeMap[$relative] = $baselineBlob
+  }
+
+  $tempBlobNames = Get-BlobNamesByPrefix -Prefix "$TempRoot/" -StorageToken $StorageToken
+  foreach ($tempBlob in $tempBlobNames) {
+    if ($tempBlob -like '*/_manifest.json') { continue }
+    if ($tempBlob -notlike '*.json') { continue }
+
+    $relative = $tempBlob.Substring(("$TempRoot/").Length)
+    [void]$currentRelativeSet.Add($relative)
+
     $slash = $relative.IndexOf('/')
     if ($slash -lt 1) { continue }
-
     $type = $relative.Substring(0, $slash)
     $fileName = $relative.Substring($slash + 1)
     if (-not $fileName.EndsWith('.json')) { continue }
-
     $id = $fileName.Substring(0, $fileName.Length - 5)
-    $key = Build-PolicyKey -PolicyType $type -PolicyId $id
-    $baselineMap[$key] = $baselineBlob
-  }
 
-  foreach ($policy in $TempPolicies) {
-    $type = [string]$policy.policyType
-    $id = [string]$policy.policyId
-    $name = [string]$policy.policyName
+    $changePath = "$ChangesPrefix/$TimestampFolder/$relative"
+    $currentContent = Read-JsonBlob -BlobPath $tempBlob -StorageToken $StorageToken
+    $currentJson = Get-NormalizedJson -Object $currentContent
+    $name = Get-ObjectName -Object $currentContent
 
-    $key = Build-PolicyKey -PolicyType $type -PolicyId $id
-    [void]$currentKeys.Add($key)
-
-    $changePath = "$ChangesPrefix/$TimestampFolder/$type/$id.json"
-    $currentJson = Get-NormalizedJson -Object $policy.content
-
-    if (-not $baselineMap.ContainsKey($key)) {
+    if (-not $baselineRelativeMap.ContainsKey($relative)) {
       $doc = [ordered]@{
         changeType = 'added'
         policyType = $type
@@ -885,7 +918,7 @@ function Compare-And-WriteChanges {
         policyName = $name
         detectedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
         baselineExists = $false
-        current = $policy.content
+        current = $currentContent
       }
 
       [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
@@ -893,7 +926,7 @@ function Compare-And-WriteChanges {
       continue
     }
 
-    $baselinePath = [string]$baselineMap[$key]
+    $baselinePath = [string]$baselineRelativeMap[$relative]
     $baselineContent = Read-JsonBlob -BlobPath $baselinePath -StorageToken $StorageToken
     $baselineJson = Get-NormalizedJson -Object $baselineContent
 
@@ -905,21 +938,17 @@ function Compare-And-WriteChanges {
         policyName = $name
         detectedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
         baseline = $baselineContent
-        current = $policy.content
+        current = $currentContent
       }
 
       [void](Write-JsonBlob -BlobPath $changePath -Data $doc -StorageToken $StorageToken)
       $changesWritten++
     }
 
-    [void]$baselineMap.Remove($key)
+    [void]$baselineRelativeMap.Remove($relative)
   }
 
-  foreach ($baselineBlob in $baselineMap.Values) {
-    $relative = [string]$baselineBlob
-    if ($relative.StartsWith("$BaselinePrefix/")) {
-      $relative = $relative.Substring(("$BaselinePrefix/").Length)
-    }
+  foreach ($relative in $baselineRelativeMap.Keys) {
     $slash = $relative.IndexOf('/')
     if ($slash -lt 1) { continue }
 
@@ -927,13 +956,12 @@ function Compare-And-WriteChanges {
     $fileName = $relative.Substring($slash + 1)
     if (-not $fileName.EndsWith('.json')) { continue }
 
-    $id = $fileName.Substring(0, $fileName.Length - 5)
-    $key = Build-PolicyKey -PolicyType $type -PolicyId $id
+  $id = $fileName.Substring(0, $fileName.Length - 5)
+  if ($currentRelativeSet.Contains($relative)) { continue }
 
-    if ($currentKeys.Contains($key)) { continue }
-
+  $baselineBlob = [string]$baselineRelativeMap[$relative]
     $baselineContent = Read-JsonBlob -BlobPath $baselineBlob -StorageToken $StorageToken
-    $changePath = "$ChangesPrefix/$TimestampFolder/$type/$id.json"
+  $changePath = "$ChangesPrefix/$TimestampFolder/$relative"
 
     $doc = [ordered]@{
       changeType = 'removed'
@@ -1009,7 +1037,7 @@ try {
   [void](Write-JsonBlob -BlobPath "$tempRoot/_manifest.json" -Data $tempManifest -StorageToken $storageToken)
   Write-RunbookLog -Level 'INFO' -Message "Temp snapshot written: '$tempRoot' with $tempSaved policy JSON file(s)."
 
-  $changesWritten = Compare-And-WriteChanges -TempPolicies $policies -BaselinePrefix $BaselinePrefix -ChangesPrefix $ChangesPrefix -StorageToken $storageToken -TimestampFolder $TimestampFolder
+  $changesWritten = Compare-And-WriteChanges -TempRoot $tempRoot -BaselinePrefix $BaselinePrefix -ChangesPrefix $ChangesPrefix -StorageToken $storageToken -TimestampFolder $TimestampFolder
 
   $changesSummary = [ordered]@{
     generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
